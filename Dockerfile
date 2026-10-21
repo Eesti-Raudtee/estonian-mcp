@@ -30,6 +30,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev
 
+# EstNLTK bundles MaltParser, a Java parser, with log4j 1.2.14 (end of
+# life, known CVEs). The server never runs MaltParser and the image has
+# no Java runtime, so delete the jar before it reaches the runtime stage.
+RUN find /opt/venv -name 'log4j*.jar' -print -delete
+
 # Pre-download EstNLTK WordNet (~26 MB) into the venv's resources dir so
 # the `synonyms` tool doesn't trigger an interactive download prompt on
 # first call at runtime. The "y" pipes past the [Y/n] prompt baked into
@@ -104,6 +109,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8081 \
     HOST=0.0.0.0 \
     ESTNLTK_MCP_TRANSPORT=http
+
+# The server runs from /opt/venv, which has no pip. The base image's own
+# pip is never used, and it vendors urllib3, msgpack and setuptools
+# releases with known CVEs (pip 26.2.2 still does), so remove it.
+RUN /usr/local/bin/python3 -m pip uninstall --yes pip
 
 # Drop privileges. EstNLTK has no need for root.
 RUN groupadd --system --gid 1000 app \
