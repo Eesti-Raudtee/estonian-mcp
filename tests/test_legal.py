@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -140,6 +141,203 @@ def defined_terms_tests() -> None:
         check("over MAX_DOC_CHARS raises", True)
 
 
+def defined_terms_quote_tests() -> None:
+    print("check_defined_terms quote styles")
+    # Estonian typography closes „ with “ (U+201C); that pairing used to
+    # define nothing. Every pairing defines the same term, counted alike.
+    styles = {
+        "«»": ("«", "»"),
+        "„“": ("„", "“"),
+        "„”": ("„", "”"),
+        '""': ('"', '"'),
+        "“”": ("“", "”"),
+    }
+    for label, (o, c) in styles.items():
+        r = server.check_defined_terms(
+            f"Käesolev leping (edaspidi {o}Leping{c}) jõustub. Leping lõpeb 2027.")
+        check(f"{label} defines Leping, used twice, no issues",
+              r["defined_terms"] == [{"term": "Leping", "position": 17,
+                                      "definitions": 1, "total_occurrences": 2}]
+              and r["issues"] == [], str(r))
+
+    # A „“ contract maps exactly like the same contract written with «».
+    base = ('Käesoleva lepingu (edaspidi «Leping») pooled on AS Müük '
+            '(edaspidi «Müüja») ja OÜ Ostja (edaspidi ühiselt «Pooled»). '
+            'Müüja annab kauba üle. Leping jõustub. Kokkulepe (edaspidi '
+            '«Kokkulepe») ja (edaspidi «Müüja»).')
+    low = base.replace("«", "„").replace("»", "“")
+    check("„“ document maps exactly like the «» one",
+          server.check_defined_terms(low) == server.check_defined_terms(base),
+          str(server.check_defined_terms(low)))
+
+    # Two terms in one sentence, each in its own style, neither swallows
+    # the other's closing quote.
+    mixed = server.check_defined_terms(
+        'AS Müük (edaspidi „Müüja“) ja OÜ Ost (edaspidi «Ostja») ning Pank '
+        '(edaspidi “Pank”) sõlmivad lepingu. Müüja, Ostja ja Pank allkirjastavad.')
+    terms = [t["term"] for t in mixed["defined_terms"]]
+    check("mixed styles in one sentence define all three",
+          terms == ["Müüja", "Ostja", "Pank"], str(mixed["defined_terms"]))
+    check("no term holds a quote character",
+          not any(set(t) & set("«»„“”\"") for t in terms), str(terms))
+    check("mixed styles: every term used, no issues", mixed["issues"] == [], str(mixed["issues"]))
+
+    # A multi-word term.
+    sp = server.check_defined_terms(
+        "AS Teenus (edaspidi „Teenuse osutaja“) osutab teenust. Teenuse osutaja vastutab.")
+    check("„Teenuse osutaja“ is one term, used twice",
+          sp["defined_terms"] == [{"term": "Teenuse osutaja", "position": 11,
+                                   "definitions": 1, "total_occurrences": 2}]
+          and sp["issues"] == [], str(sp))
+
+    # A term defined in two quote styles is still one term, defined twice.
+    dup = server.check_defined_terms(
+        "Pool (edaspidi «Müüja») ja teine (edaspidi „Müüja“). Müüja tegutseb.")
+    dd = next((i for i in dup["issues"] if i["rule"] == "duplicate-definition"), {})
+    check("duplicate-definition across «» and „“",
+          dd.get("explanation") == "Mõiste «Müüja» on defineeritud 2 korda."
+          and dup["defined_terms"][0]["definitions"] == 2, str(dup))
+
+    # defined-but-unused fires for a „“ definition as for a «» one.
+    un = server.check_defined_terms("Käesolev kokkulepe (edaspidi „Kokkulepe“) jõustub täna.")
+    check("„Kokkulepe“ unused → defined-but-unused",
+          [i["rule"] for i in un["issues"]] == ["defined-but-unused"], str(un["issues"]))
+
+    # 'ühiselt' and 'nimetatud' work with „“, and the bare form still does.
+    pooled = server.check_defined_terms(
+        "Müüja ja Ostja (edaspidi ühiselt nimetatud „Pooled“) lepivad kokku. Pooled kinnitavad.")
+    check("edaspidi ühiselt nimetatud „Pooled“",
+          [t["term"] for t in pooled["defined_terms"]] == ["Pooled"], str(pooled["defined_terms"]))
+    bare = server.check_defined_terms("Käesolev leping (edaspidi nimetatud Leping) jõustub. Leping lõpeb.")
+    check("bare 'edaspidi nimetatud Leping' still defines Leping",
+          [t["term"] for t in bare["defined_terms"]] == ["Leping"], str(bare["defined_terms"]))
+    # A missing space before the quote is still a definition.
+    glued = server.check_defined_terms('Leping (edaspidi"Leping") jõustub. Leping lõpeb.')
+    check('edaspidi"Leping" without a space still defines Leping',
+          [t["term"] for t in glued["defined_terms"]] == ["Leping"], str(glued["defined_terms"]))
+
+    # Estonian nests «» inside „“: the inner pair stays in the term.
+    nest = server.check_defined_terms(
+        "Programm (edaspidi „Programm «Kevad»“) algab. Programm «Kevad» lõpeb.")
+    check("„Programm «Kevad»“ keeps its inner quotes",
+          [(t["term"], t["total_occurrences"]) for t in nest["defined_terms"]]
+          == [("Programm «Kevad»", 2)], str(nest["defined_terms"]))
+
+    # 'edaspidi' closing a quotation is not a definition: “ and " close
+    # there, so what follows them up to the next quote is not a term.
+    for quoted in ('"Teen seda edaspidi", ütles ta. "Ei tee."',
+                   "„Maksan edaspidi“, ütles ta ja lisas “aitäh”.",
+                   "„Maksan edaspidi“, ütles ta. „Aitäh“, vastas teine."):
+        q = server.check_defined_terms(quoted)
+        check(f"no term from {quoted!r}", q["defined_terms"] == [] and q["issues"] == [], str(q))
+
+    # A definition follows '(' or ','. The adverb 'edaspidi' before a
+    # quotation (reported speech, emphasis, new wording) defines nothing,
+    # in any quote style.
+    for o, c in (("„", "“"), ("„", "”"), ("«", "»"), ('"', '"'), ("“", "”")):
+        for adverbial in (f"Hageja väitis, et kostja lubas edaspidi {o}kõik võlad tasuda{c}, "
+                          "kuid ei teinud seda.",
+                          f"Pooled kohustuvad edaspidi {o}heas usus{c} läbirääkimisi pidama.",
+                          f"Punkti 4.1 sõnastus on edaspidi {o}Üür on 650 eurot kuus{c}."):
+            q = server.check_defined_terms(adverbial)
+            check(f"no term from {adverbial[:40]!r}",
+                  q["defined_terms"] == [] and q["issues"] == [], str(q))
+        for lead in (f"AS Alfa, edaspidi {o}Müüja{c}, müüb. Müüja maksab.",
+                     f"AS Alfa,\nedaspidi {o}Müüja{c}, müüb. Müüja maksab.",
+                     f"AS Alfa ( edaspidi {o}Müüja{c}) müüb. Müüja maksab."):
+            check(f"{lead[:28]!r} defines Müüja",
+                  [t["term"] for t in server.check_defined_terms(lead)["defined_terms"]]
+                  == ["Müüja"], str(server.check_defined_terms(lead)["defined_terms"]))
+
+    # Uses are counted in one pass over the text, as a regex per term
+    # counts them: a term inside a longer one still counts.
+    nested = ("AS Alfa (edaspidi „Teenuse osutaja“) ja Teenuse (edaspidi „Teenuse“) lepivad "
+              "kokku. Teenuse osutaja vastutab, Teenuse hind ja Teenuse-osutaja. Teenused.")
+    want = {t: len(re.findall(r"(?<!\w)" + re.escape(t) + r"(?!\w)", nested))
+            for t in ("Teenuse osutaja", "Teenuse")}
+    got = {t["term"]: t["total_occurrences"]
+           for t in server.check_defined_terms(nested)["defined_terms"]}
+    check("a term inside a longer term is counted",
+          got == want == {"Teenuse osutaja": 2, "Teenuse": 6}, str(got))
+    # A regex per term made thousands of terms take seconds.
+    many = "".join(f"(edaspidi „T{i}“) T{i}. " for i in range(6000))[:100_000]
+    start = time.perf_counter()
+    r = server.check_defined_terms(many)
+    elapsed = time.perf_counter() - start
+    check("thousands of terms stay fast", elapsed < 5 and len(r["defined_terms"]) > 3000
+          and r["defined_terms"][0]["total_occurrences"] == 2, f"{elapsed:.1f} s")
+
+    # An unclosed quote before a long blank run used to backtrack
+    # quadratically (minutes at this size).
+    start = time.perf_counter()
+    server.check_defined_terms("Leping (edaspidi „Leping" + " " * 200_000)
+    elapsed = time.perf_counter() - start
+    check("unclosed quote before a long blank run stays linear", elapsed < 5, f"{elapsed:.1f} s")
+
+    def found(text: str) -> list[tuple[str, int, int]]:
+        r = server.check_defined_terms(text)
+        return [(t["term"], t["definitions"], t["total_occurrences"]) for t in r["defined_terms"]]
+
+    # An unclosed opener defines nothing and hides none of the definitions
+    # after it, even with a straight or curly quote later in the text.
+    for o in ("«", "„", '"'):
+        broken = (f'AS Alfa (edaspidi {o}Müüja), OÜ Beeta (edaspidi «Ostja») ja AS Gamma '
+                  '(edaspidi «Käendaja») sõlmisid käesoleva lepingu (edaspidi «Leping»). '
+                  'Ostja tasub, Käendaja tagab ja Leping kehtib. Kaup tarnitakse OÜ "Delta" '
+                  'ja “Smart” kaudu, ekraan 27".')
+        r = server.check_defined_terms(broken)
+        check(f"unclosed {o}Müüja) hides no later definition",
+              found(broken) == [("Ostja", 1, 2), ("Käendaja", 1, 2), ("Leping", 1, 2)]
+              and r["issues"] == [], str(r))
+    # The same without parentheses: the term stops at the next 'edaspidi'.
+    loose = ('AS Alfa, edaspidi «Müüja, ja OÜ Beeta, edaspidi «Ostja», sõlmivad '
+             'lepingu. Ostja tasub OÜ "Delta" kaudu.')
+    check("unclosed opener stops at the next edaspidi",
+          found(loose) == [("Ostja", 1, 2)], str(found(loose)))
+    # Nor does an unclosed opener with no stop at all become a term when
+    # the next quote is far away.
+    far = "Leping, edaspidi „Leping, " + "kehtib ja " * 30 + 'OÜ "Delta" kaudu.'
+    check("unclosed opener with a distant quote defines nothing", found(far) == [], str(found(far)))
+
+    # A doubled opener is a typo and is skipped.
+    check("««Leping» defines Leping",
+          found("Teenusleping (edaspidi ««Leping») jõustub. Leping lõpeb 2027.")
+          == [("Leping", 1, 2)])
+    dbl = ('Müüja (edaspidi ««Müüja»), Ostja (edaspidi «Ostja») ja Pank (edaspidi '
+           '«Pank») sõlmivad lepingu. Müüja, Ostja ja Pank. Hoone asub aadressil "Pikk 1".')
+    check("««Müüja» hides no later definition",
+          found(dbl) == [("Müüja", 1, 3), ("Ostja", 1, 3), ("Pank", 1, 3)], str(found(dbl)))
+
+    # Inner quotes around the whole term are double quoting, not the name;
+    # an inner pair that starts the name stays.
+    for o, c in (("„", "“"), ('"', '"'), ("“", "”")):
+        r = server.check_defined_terms(
+            f"Teenusleping (edaspidi {o}«Leping»{c}) jõustub. Leping lõpeb 2027.")
+        check(f"{o}«Leping»{c} defines Leping, no issues",
+              [(t["term"], t["total_occurrences"]) for t in r["defined_terms"]] == [("Leping", 2)]
+              and r["issues"] == [], str(r))
+    check("„'Leping'“ defines Leping",
+          found("Teenusleping (edaspidi „'Leping'“) jõustub. Leping lõpeb.") == [("Leping", 1, 2)])
+    green = "Linn (edaspidi „«Roheline linn» 2030“) algab. «Roheline linn» 2030 lõpeb."
+    check("„«Roheline linn» 2030“ keeps its inner quotes",
+          found(green) == [("«Roheline linn» 2030", 1, 2)], str(found(green)))
+
+    # An apostrophe that belongs to the name stays in the term.
+    for text, term in (("Kohvik (edaspidi «Kohvik 'Kodu'») avati. Kohvik 'Kodu' on avatud.",
+                        "Kohvik 'Kodu'"),
+                       ("Firma (edaspidi „Jones'“) maksab. Jones' esindaja allkirjastab.", "Jones'"),
+                       ("Firma (edaspidi „McDonald’s“) maksab. McDonald’s esindaja kirjutab.",
+                        "McDonald’s")):
+        check(f"{term!r} keeps its apostrophe", found(text) == [(term, 1, 2)], str(found(text)))
+
+    # Parentheses inside a term and a word starting with 'edaspidi' stay.
+    for text, term in (("Hind (edaspidi „Hind (käibemaksuta)“) on lõplik. Hind (käibemaksuta) "
+                        "tasutakse.", "Hind (käibemaksuta)"),
+                       ("Kokkulepe (edaspidi „Edaspidise koostöö kokkulepe“) jõustub. "
+                        "Edaspidise koostöö kokkulepe kehtib.", "Edaspidise koostöö kokkulepe")):
+        check(f"{term!r} is one term", found(text) == [(term, 1, 2)], str(found(text)))
+
+
 def is_legal_term_tests() -> None:
     print("_is_legal_term")
     check("solidaarvõlgnik is legal", server._is_legal_term("solidaarvõlgnik"))
@@ -195,6 +393,7 @@ def common_legal_usage_tests() -> None:
 
 legalese_tests()
 defined_terms_tests()
+defined_terms_quote_tests()
 is_legal_term_tests()
 common_legal_usage_tests()
 

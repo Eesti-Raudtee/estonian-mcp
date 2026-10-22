@@ -91,7 +91,7 @@ DEFAULT_STATIC_RATE_LIMIT_PER_MINUTE = 60
 _TRUSTED_PROXY_HOPS = max(0, int(os.environ.get("ESTNLTK_MCP_TRUSTED_PROXY_HOPS", "1")))
 
 # Bumped manually in lockstep with pyproject.toml's [project].version.
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.8.1"
 
 # Favicons served alongside the MCP endpoint so Google's favicon service
 # (used by the Anthropic Connectors Directory + tool-call UI in Claude)
@@ -893,6 +893,48 @@ _COMMA_BEFORE: frozenset[str] = frozenset({
     "mistõttu", "millepärast", "kuhu",
 })
 
+# Two-part connectives (EKI teatmik, Koma: ühendsidendid): the first parts
+# that can stand right before the subordinator. A comma before the whole
+# connective sets it off (Sadas vihma, nii et jäime koju).
+_PAIR_FIRST: dict[str, frozenset[tuple[str, ...]]] = {
+    "et": frozenset({
+        ("nii",), ("ilma",), ("olgugi",), ("selleks",), ("sellepärast",),
+        ("seepärast",), ("seetõttu",), ("vaevalt",), ("peaasi",), ("ainult",),
+        ("mitte",), ("selle", "asemel"), ("hoolimata", "sellest"),
+        ("olenemata", "sellest"), ("vaatamata", "sellele"),
+    }),
+    "nagu": frozenset({("nii",)}),
+}
+
+# First parts a comma never separates from et (Ta lahkus, ilma et oleks
+# hüvasti jätnud), so the comma they lack goes before them.
+_PAIR_UNSPLIT: frozenset[str] = frozenset({"ilma", "olgugi"})
+
+# Quotation marks. One not glued to the word before it (sõna“) opens a
+# quotation, and the word after it starts a sentence.
+_QUOTE_MARKS: frozenset[str] = frozenset({"„", "“", "”", '"', "«", "»"})
+
+# Where the scan after a nagu stops. A sentence end, or a subordinator or
+# adversative opening the next clause, with no verb seen: a verbless
+# comparison (tugev nagu karu.). Other clause punctuation: undecided, so
+# the comma is asked for, as 0.8.0 always did (Tegin nagu ema, kes ...,
+# soovitas). ja / ning / ega / või do not stop it: they join words as
+# often as clauses (nagu ema ja isa olid õpetanud).
+_SENTENCE_END_MARKS: frozenset[str] = frozenset({".", "!", "?", "…", "..."})
+_CLAUSE_MARKS: frozenset[str] = frozenset(",;:()[]-\u2013\u2014")
+_NAGU_CLAUSE_END: frozenset[str] = _COMMA_BEFORE | {"kuid", "aga"}
+_COORDINATORS: frozenset[str] = frozenset({"ja", "ning", "ega", "või"})
+
+# Vabamorf verb form codes that make no clause after nagu: the
+# infinitives and supines, the des form, the present participles. Every
+# other verb code is a personal or impersonal form in some mood, or a
+# negation (ei, pole). The past participles nud / tud are left out on
+# purpose: nagu kokku lepitud, nagu öeldud are clauses that drop olema
+# and take the comma (EKI).
+_NONFINITE_FORMS: frozenset[str] = frozenset({
+    "da", "des", "ma", "mas", "mast", "maks", "mata", "tama", "v", "tav",
+})
+
 
 # Lexicons for check_redundancy: semantic doubling that's
 # grammatically fine but reads redundant to a native speaker. Kept
@@ -1670,7 +1712,10 @@ def _form_et(code: str, lemma: str | None = None) -> str | None:
 # comparative (parem, suurem) and every superlative (parim, suurim) in
 # Estonian, 1.5% of the 20k most frequent word forms. Vabamorf synthesises
 # all three correctly under their own POS code; the tool just never asked.
-_NOMINAL_POS: frozenset[str] = frozenset({"S", "A", "P", "N", "O", "C", "U"})
+# H (proper noun) was missing the same way, so Tallinn, Tartu and Jaan were
+# all said not to inflect. Its synthesis is lexicon-only: see
+# _LEXICON_ONLY_POS.
+_NOMINAL_POS: frozenset[str] = frozenset({"S", "H", "A", "P", "N", "O", "C", "U"})
 
 # POS codes we will promote a non-inflecting reading TO. Deliberately
 # excludes S: a function word's surface routinely collides with some rare
@@ -1696,6 +1741,7 @@ _NOMINAL_KEY_FORM = "sg g"
 # reader. A bare tagset letter in an Estonian sentence is not an answer.
 _POS_LABELS_ET: dict[str, str] = {
     "S": "nimisõna",
+    "H": "pärisnimi",
     "A": "omadussõna",
     "C": "omadussõna keskvõrdes",
     "U": "omadussõna ülivõrdes",
@@ -1721,6 +1767,17 @@ def _pos_et(pos: str) -> str:
     return f"{pos} ({label})" if label else f"{pos}"
 
 
+# POS codes synthesised from Vabamorf's lexicon alone, its guesser off. Given
+# a capitalised word it does not know, the guesser makes a name of whatever
+# it was handed: a sentence-initial `Teatris` (inessive of teater) comes back
+# as a name `Teatris : Teatrise`, a compound with its internal marker left
+# in (`Kultuurik_atlase`). For the 2,699 names in the corpus vocabulary
+# that the lexicon knows, the guesser changes no surface in any slot, so
+# switching it off costs nothing real. Google and Lindgren get no forms
+# instead of invented ones; Teatris gets the answer for teatris.
+_LEXICON_ONLY_POS: frozenset[str] = frozenset({"H"})
+
+
 def _synthesize(lemma: str, form: str, pos: str = "", hint: str = "") -> list[str]:
     """Vabamorf synthesis for one form: deduplicated, order preserved.
 
@@ -1743,10 +1800,36 @@ def _synthesize(lemma: str, form: str, pos: str = "", hint: str = "") -> list[st
     had to guess why.
     """
     try:
-        got = _vabamorf().synthesize(lemma, form, pos, hint) or []
+        got = _vabamorf().synthesize(lemma, form, pos, hint,
+                                     guess=pos not in _LEXICON_ONLY_POS) or []
     except Exception:
         return []
     return list(dict.fromkeys(got))
+
+
+def _lexicon_readings(word: str) -> list[dict]:
+    """Vabamorf's readings of `word` from its lexicon alone: no guesser, and
+    none of the proper-name heuristics that make a name of any capitalised
+    word. Empty when the lexicon does not know the word."""
+    try:
+        return _vabamorf().analyze([word], disambiguate=False, guess=False,
+                                   propername=False)[0].get("analysis") or []
+    except Exception:
+        return []
+
+
+def _lexicon_names(word: str) -> list[str]:
+    """The proper-noun lemmas the lexicon itself gives `word`, leaving out
+    the entries it lists only as an indeclinable name part (form `?`: New,
+    San, Franz)."""
+    return list(dict.fromkeys(
+        a["lemma"] for a in _lexicon_readings(word)
+        if a.get("partofspeech") == "H" and a.get("form") != "?"))
+
+
+def _name_inflects(lemma: str) -> bool:
+    """Whether the lexicon can inflect the proper noun `lemma` at all."""
+    return bool(_synthesize(lemma, "sg n", "H") or _synthesize(lemma, "pl n", "H"))
 
 
 def _corpus_ranks() -> dict | None:
@@ -1764,7 +1847,8 @@ def _corpus_ranks() -> dict | None:
         return None
 
 
-def _rank_paradigm_keys(keys: list[str]) -> tuple[list[str], bool]:
+def _rank_paradigm_keys(keys: list[str], pos: str = "",
+                        lemma: str = "") -> tuple[list[str], bool]:
     """Order homonymous paradigms by corpus attestation, best first.
 
     Vabamorf's candidate order is lexicon order, not a preference ranking:
@@ -1775,6 +1859,13 @@ def _rank_paradigm_keys(keys: list[str]) -> tuple[list[str], bool]:
     Returns (ordered keys, whether corpus evidence was actually used). With
     no model installed the order is Vabamorf's, unchanged, and the caller
     is told so rather than being handed a silent guess.
+
+    A name's keys (`pos` H) are looked up as spelled. The vocabulary keeps
+    case, so the lowercased `yorgi` and `yorki` find nothing where `Yorgi`
+    and `Yorki` are both attested. The name's own nominative is not
+    counted: `Jane` is also the key of the `Jane : Jane` type, and its
+    count says nothing about that type over `Jane’i`. Every other key is
+    looked up lowercased, as it always was.
     """
     # The length check comes FIRST. _corpus_ranks() deserialises a 34 MB
     # model, and there is nothing to rank below two candidates, so putting
@@ -1785,13 +1876,17 @@ def _rank_paradigm_keys(keys: list[str]) -> tuple[list[str], bool]:
     ranks = _corpus_ranks()
     if not ranks:
         return (keys, False)
+    if pos == "H":
+        found = [ranks.get(k) if k != lemma else None for k in keys]
+    else:
+        found = [ranks.get(k.lower()) for k in keys]
     unattested = len(ranks) + 1
     order = sorted(
         range(len(keys)),
-        key=lambda i: (ranks.get(keys[i].lower(), unattested), i),
+        key=lambda i: (unattested if found[i] is None else found[i], i),
     )
     ordered = [keys[i] for i in order]
-    used = any(k.lower() in ranks for k in keys)
+    used = any(r is not None for r in found)
     return (ordered, used)
 
 
@@ -1807,7 +1902,7 @@ def _paradigm_hints(lemma: str, pos: str, key_form: str) -> tuple[list[str], boo
     number measures this code and not a re-implementation of it.
     """
     keys = _synthesize(lemma, key_form, pos)
-    ranked, used = _rank_paradigm_keys(keys)
+    ranked, used = _rank_paradigm_keys(keys, pos, lemma)
     if len(ranked) < 2:
         return ([""], False)
     return (ranked, used)
@@ -1890,6 +1985,16 @@ def _rank_surfaces(surfaces: list[str], stem: str) -> list[str]:
     return sorted(surfaces, key=lambda w: not w.startswith(stem))
 
 
+def _table_surfaces(forms: list[dict]) -> set[str]:
+    """Every surface in one paradigm table, a slot's variants included."""
+    return {s for e in forms
+            for s in ([e["surface"]] if isinstance(e["surface"], str) else e["surface"])}
+
+
+# The ASCII apostrophe and the modifier letter, as Vabamorf's U+2019.
+_APOSTROPHES = str.maketrans("'\u02bc", "\u2019\u2019")
+
+
 def _build_forms(lemma: str, pos: str, form_list, labels: dict, hint: str) -> list[dict]:
     """One paradigm table, generated under a single paradigm hint."""
     # The stems this table's own oblique forms are built on, generated
@@ -1945,6 +2050,16 @@ def _paradigm(word: str) -> dict:
     lemma = primary["lemma"]
     pos = primary["partofspeech"]
     reading_et = ""
+
+    if pos == "H" and not _name_inflects(lemma):
+        # The disambiguator can put a guessed lemma ahead of the lexicon's
+        # own: Lõuna-Eesti as `Lõuna-Eest`, Ida-Euroopa as `Ida-Euroobas`,
+        # Kesk-Euroopat as a nominative `Kesk-Euroopat`. The lexicon's own
+        # name for the word wins, one the disambiguator also kept first.
+        names = _lexicon_names(word)
+        if names:
+            kept = {a["lemma"] for a in analyses[0]["analysis"]}
+            lemma = next((n for n in names if n in kept), names[0])
 
     if pos not in _NOMINAL_POS and pos != "V":
         # The isolated-word reading does not inflect. Before claiming the
@@ -2011,20 +2126,27 @@ def _paradigm(word: str) -> dict:
         # contains it would have answered `paradigm("kotti")` with `kota`
         # whenever corpus ranking was unavailable, while claiming the input
         # had decided. A form in more than one table is left to the ranking.
-        w = word.lower()
-        if w != lemma.lower():
+        #
+        # Vabamorf writes a name's apostrophe as U+2019 (Margot’d) and reads
+        # the ASCII one as the same, so both are compared as one character.
+        w = word.lower().translate(_APOSTROPHES)
+        if w != lemma.lower().translate(_APOSTROPHES):
             matched = [
                 i for i, (_key, forms) in enumerate(tables)
-                if w in {
-                    s.lower()
-                    for entry in forms
-                    for s in ([entry["surface"]] if isinstance(entry["surface"], str)
-                              else entry["surface"])
-                }
+                if w in {s.lower().translate(_APOSTROPHES) for s in _table_surfaces(forms)}
             ]
             if len(matched) == 1:
                 tables.insert(0, tables.pop(matched[0]))
                 chosen_by_input = True
+
+    # The lexicon lists some names only as an indeclinable part of a longer
+    # one (form `?`: New, San, Rio, also Franz and Charlotte), and gives the
+    # lemma for every slot. Names inflect, so that table is no answer:
+    # `Charlottega` would come back as "Charlotte ei muutu".
+    name_part = (pos == "H" and len(tables) == 1 and bool(tables[0][1])
+                 and _table_surfaces(tables[0][1]) == {lemma})
+    if name_part:
+        tables = [("", [])]
 
     key, forms = tables[0]
     # Every table is built from the same `labels`, so a code the first
@@ -2046,7 +2168,29 @@ def _paradigm(word: str) -> dict:
         "forms": forms,
         "paradigm_count": len(tables),
     }
-    if not forms:
+    if not forms and pos == "H":
+        lower = word.lower()
+        if lower != word and _lexicon_readings(lower):
+            # A capitalised common word Vabamorf took for a name it has no
+            # table for (a sentence-initial Pikk, Raamat, Neljas): the
+            # answer is the lowercase word's.
+            common = _paradigm(lower)
+            note = (f"Vabamorf ei oska sõna '{word}' pärisnimena käänata, siin on "
+                    f"vastus sõnale '{lower}'.")
+            common["reading_estonian"] = " ".join(
+                filter(None, (note, common.get("reading_estonian"))))
+            return common
+        # A name the lexicon lacks (Google, Lindgren). Names inflect, so
+        # "0 vormi" alone would read as "does not inflect". The input is
+        # named, not the lemma: an unknown name's lemma is a guess.
+        if name_part:
+            result["summary_estonian"] = (
+                f"Vabamorf tunneb sõna '{lemma}' ainult mitmesõnalise nime "
+                f"muutumatu osana (nagu New nimes New York) ega oska seda eraldi käänata.")
+        else:
+            result["summary_estonian"] = (
+                f"Vabamorf ei tunne sõna '{word}' pärisnimena ega oska seda käänata.")
+    elif not forms:
         # `ei` reaches this path as a verb with no forms; a table that is
         # not empty explains itself.
         result["summary_estonian"] = (
@@ -2077,12 +2221,7 @@ def _paradigm(word: str) -> dict:
             f"Sõnal '{lemma}' on Vabamorfi sõnastikus {len(tables)} eri muuttüüpi "
             f"({all_keys}). {why} Ülejäänud tüübid on väljal 'other_paradigms'.{hint_et}"
         )
-    surfaces = {
-        s for entry in forms
-        for s in ([entry["surface"]] if isinstance(entry["surface"], str)
-                  else entry["surface"])
-    }
-    if forms and surfaces == {lemma}:
+    if forms and _table_surfaces(forms) == {lemma}:
         result["invariant"] = True
         result["invariant_estonian"] = f"Sõna '{lemma}' ei muutu, kõik vormid on ühesugused."
     return result
@@ -2605,6 +2744,68 @@ def check_compounds(text: Annotated[str, Field(description="Estonian text.")]) -
     return _check_compounds(text)
 
 
+def _pair_start(spans: list, i: int) -> int | None:
+    """Where the two-part connective ending in the subordinator at spans[i]
+    (nii et, selle asemel et, nii nagu) starts, if it is one."""
+    firsts = _PAIR_FIRST.get(spans[i].text.lower(), frozenset())
+    for n in (2, 1):
+        if i >= n and tuple(s.text.lower() for s in spans[i - n:i]) in firsts:
+            return i - n
+    return None
+
+
+def _opening_quote(spans: list, k: int) -> bool:
+    """spans[k] opens a quotation, so what follows it starts a sentence:
+    „ and « always open; the other marks only when nothing is glued to
+    them from the left (a mark glued to a word or to ! ? closes one:
+    „Mine ära!“ nii et)."""
+    if spans[k].text in {"„", "«"}:
+        return True
+    return spans[k].text in _QUOTE_MARKS and (k == 0 or spans[k - 1].end < spans[k].start)
+
+
+@lru_cache(maxsize=4096)
+def _may_be_finite(word: str) -> bool:
+    """Some lexicon reading of `word` is a clause verb. Read out of context,
+    as the sentence analysis keeps one reading of a homograph: sõnas,
+    lisas, selgus and tuli are nouns there as often as verbs."""
+    found = _vabamorf().analyze([word], disambiguate=False, guess=False, propername=False)
+    return any(r["partofspeech"] == "V" and r["form"] not in _NONFINITE_FORMS
+               for r in (found[0].get("analysis") or []))
+
+
+def _verb_after(spans: list, i: int) -> bool:
+    """False only for a clear verbless comparison (tugev nagu karu.), which
+    takes no comma: no word after the nagu at spans[i] can be a clause verb
+    before the sentence ends or the next subordinator opens a clause.
+    Otherwise nagu opens a clause (Vaatas mind, nagu oleksin võõras) or the
+    scan hit clause punctuation and cannot tell, and the comma is asked
+    for, as 0.8.0 did."""
+    def verb(span) -> bool:
+        return (any(a.partofspeech == "V" and a.form not in _NONFINITE_FORMS
+                    for a in span.annotations) or _may_be_finite(span.text))
+
+    for k in range(i + 1, len(spans)):
+        span = spans[k]
+        nxt = spans[k + 1] if k + 1 < len(spans) else None
+        if span.text in _SENTENCE_END_MARKS or span.text.lower() in _NAGU_CLAUSE_END:
+            return False
+        if span.text.lower() in _COORDINATORS:
+            # ja + verb: a second predicate of the main clause (jooksis
+            # nagu tuul ja hüppas); ja + anything else stays in the scan.
+            if nxt is not None and verb(nxt):
+                return False
+            continue
+        if not any(ch.isalnum() for ch in span.text) and not _CLAUSE_MARKS.isdisjoint(span.text):
+            # A comma before a coordinator ends a verbless comparison
+            # (tugev nagu karu, aga ...); any other mark cannot tell.
+            return not (span.text == "," and nxt is not None
+                        and nxt.text.lower() in _COORDINATORS | {"aga", "kuid", "vaid"})
+        if verb(span):
+            return True
+    return False
+
+
 def _check_punctuation(text: str) -> dict:
     """Phase-1 punctuation checker: comma before subordinating words."""
     _check_text(text)
@@ -2614,7 +2815,7 @@ def _check_punctuation(text: str) -> dict:
     spans = list(t.morph_analysis)
 
     issues: list[dict] = []
-    skip_prev = {",", ";", ":", "(", "\u2014", "\u2013", "-", ".", "!", "?", "...", "…"}
+    skip_prev = {",", ";", ":", "(", "[", "\u2014", "\u2013", "-", ".", "!", "?", "...", "…"}
     for i, span in enumerate(spans):
         word_lower = span.text.lower()
         if word_lower not in _COMMA_BEFORE:
@@ -2624,12 +2825,33 @@ def _check_punctuation(text: str) -> dict:
         prev = spans[i - 1]
         if prev.text in skip_prev:
             continue
+        word, position = span.text, span.start
+        first = _pair_start(spans, i)
+        if first is not None:
+            # A comma, the sentence start or an opening quotation mark
+            # before the whole connective sets it off. A full stop counts
+            # only before a capital (vms. nii et is mid-sentence).
+            before = spans[first - 1].text if first else ""
+            capital = spans[first].text[:1].isupper()
+            # A closing quote counts as what stands before it: „jah,“ nii
+            # et has its comma, „Jah.“ Nii et starts a sentence.
+            if before in _QUOTE_MARKS and first >= 2 and not _opening_quote(spans, first - 1):
+                before = spans[first - 2].text if spans[first - 2].text in skip_prev else (
+                    "." if capital else before)
+            if (first == 0 or _opening_quote(spans, first - 1)
+                    or (before in skip_prev and (before not in _SENTENCE_END_MARKS or capital))):
+                continue
+            if spans[first].text.lower() in _PAIR_UNSPLIT:
+                position = spans[first].start
+                word = text[position:span.end]
+        if word_lower == "nagu" and not _verb_after(spans, i):
+            continue
         issues.append({
-            "word": span.text,
-            "position": span.start,
+            "word": word,
+            "position": position,
             "rule": "comma-before-clause-conjunction",
             "rule_estonian": "koma alistava sidesõna ees",
-            "suggestion": f", {span.text}",
+            "suggestion": f", {word}",
         })
 
     return {
@@ -2650,12 +2872,11 @@ def _check_punctuation(text: str) -> dict:
 @_counted
 def check_punctuation(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
     """Flags a missing comma before et, kuna, sest, kuigi, kuid, vaid, nagu,
-    mistõttu, millepärast or kuhu.
+    mistõttu, millepärast or kuhu. A comma before a pair (nii et, ilma et)
+    passes, and nagu is flagged only before a clause with a verb.
 
     Not checked: kui, mis, kes (their comma depends on meaning), list and
-    apposition commas, dashes, colons. In nii et, ilma et and selleks et the
-    comma goes before the pair, not before et; nagu in a verbless
-    comparison (tugev nagu karu) takes none.
+    apposition commas, dashes, colons.
     """
     return _check_punctuation(text)
 
@@ -2707,44 +2928,192 @@ def check_hyphenation(word: Annotated[str, Field(description="One Estonian word,
     return _check_hyphenation(word)
 
 
+# check_numbers. Thousands: a comma group is flagged only where it cannot be
+# the Estonian decimal comma, two or more groups (1,500,000) or one before a
+# period decimal (1,500.50: one issue, the decimal converted too). One group
+# (1,250) is a decimal.
+# Decimals: a period between digits is flagged, before a sentence end too
+# (Pi on 3.1416.), unless a rule below skips it. Each rule reads a bounded
+# window: the word before the number on its line, the next few characters,
+# the candidate next to it across a dash.
+# Always skipped:
+# - a comma part after the number (race time 1.47,58; 1.500,50);
+# - a version glued to v or to letters and a hyphen (v1.2, GPT-3.5);
+# - a clause number opening a line or list item, with a period after it
+#   (4.13. Tellija), or after a heading mark and before a capital (## 3.7
+#   Tulemused). Not a bare 3.7 Tulemused: data rows (9.58 Usain Bolt) look
+#   the same.
+# Skipped unless a unit, currency, per cent or multiplier follows (1.10
+# punkti, 2.5 korda, 1.25-1.50 eurot) or a currency precedes (€14.05):
+# - a time after a form of kell (kell, kella, kellaajal; not kelle, of kes)
+#   or kl (kell 10.20);
+# - a time range, both ends, the right one later (10.30-12.00; a confidence
+#   interval 1.05-1.20 too);
+# - a section or version number after its word: §, p, lg, ptk, nr, v, ver,
+#   also inflected (p-s, lg-s), or punkt, lõige, peatükk, jaotis, tabel,
+#   joonis, versioon, paragrahv, artikkel in any form, and lisa as written
+#   (Lisa is mostly the imperative, lisas mostly the past tense);
+# - a date, day 1-31 and a two-digit month (14.05, 1.05; 2.05 ja too);
+# - before a sentence end, where numbers were never flagged before, the
+#   shape of a time (väljub 6.55., ajaga 32.15.) or a word with a capital
+#   before the number (iOS 17.2., Android 4.4.); so Pi on 3.14. and Narvas
+#   5.1. are missed;
+# - a version after a product name: a capitalised word mid-sentence, not
+#   all capitals (BMI 31.2 is a measure), that Vabamorf's lexicon does not
+#   know (Python 3.12, not Tartus 8.7). A lookup can take 2 ms, so a text
+#   gets _NUM_LOOKUPS of them; past that a name is read as known.
+# A bare time mid-sentence (väljub 8.47 ja) is flagged: only kell tells it from a decimal.
+_NUM_DECIMAL_RE = re.compile(
+    r"(?<![\d.])(\d+)\.(\d+)(?!\d)(?!\.(?!\s*\Z|\s+[^\s\da-zõäöüšž]))")
+_NUM_THOUSANDS_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+)(?:\.(\d+))?(?!\d)")
+_NUM_WORD_RE = re.compile(r"\S+")
+_NUM_OPENERS = "([{«\"„“'"
+_NUM_CASE_END_RE = re.compile(r"(?<=.)-[a-zõäöüšž]{1,5}\Z")
+_NUM_UNIT_RE = re.compile(
+    r"[^\S\n]?(?:[%€]|(?:EUR|USD|CHF|SEK|GBP|kg|g|mg|t|km|m|cm|mm|l|ml|dl|s|ms"
+    r"|min|h|V|A|W|kW|Hz|kHz|MHz|GHz|bar|kPa|tl|sl|kl|korda)(?![^\W\d_²³])"
+    r"|protsent|eur|miljon|miljard|tuhat|meetr|kilo|liitr|tonn|sekund|minut"
+    r"|tund|punkt)")
+_NUM_CURRENCY_RE = re.compile(r"(?:€|(?<![^\W\d_])(?:EUR|USD|CHF|SEK|GBP))[^\S\n]?\Z")
+_NUM_RANGE_GAP_RE = re.compile(r"[^\S\n]*[-\u2013][^\S\n]*")
+_NUM_NEXT_LETTER_RE = re.compile(r"[^\S\n]+([^\W\d_])")
+_NUM_SENTENCE_START_RE = re.compile(r"(?:\A|\n|[.!?…][\"'“”»)\]]*\s)[\s\"'„“«(\[#>*•-]*\Z")
+_NUM_KELL_RE = re.compile(r"kell(?:a\w*)?|kl\.?")
+_NUM_SECTION_RE = re.compile(
+    r"(?:§|p|lg|ptk|nr|v|ver)\.?|(?:punkt|lõige|lõike|peatük"
+    r"|jaotis|tabel|joonis|versioon|paragrahv|artikl|artikkel)\w*")
+
+
+_NUM_LOOKUPS = 128
+
+
+def _number_word_known(word: str, known: dict[str, bool]) -> bool:
+    """Whether Vabamorf's lexicon knows `word`, without guessing: Tartus
+    yes, Python no. `known` holds this text's lookups. True when Vabamorf
+    fails or the text has used its lookups, so the number is flagged."""
+    if word not in known:
+        if len(known) >= _NUM_LOOKUPS:
+            return True
+        try:
+            found = _vabamorf().analyze(
+                words=[word], guess=False, propername=False, disambiguate=False)
+            known[word] = any(w["analysis"] for w in found)
+        except Exception:
+            known[word] = True
+    return known[word]
+
+
+def _number_before(text: str, start: int) -> tuple[str, str, int]:
+    """What is glued to the number at `start` ('' after a space), and the
+    word before it on its line with its start: no opening brackets or
+    quotes, trailing colon or hyphenated case ending (p-s, iOS-i)."""
+    lo = max(0, start - 40)
+    nl = text.rfind("\n", lo, start)
+    toks = list(_NUM_WORD_RE.finditer(text, nl + 1 if nl >= 0 else lo, start))[-2:]
+    glued = toks[-1].group() if toks and toks[-1].end() == start else ""
+    for tok in reversed(toks):
+        word = tok.group().lstrip(_NUM_OPENERS).rstrip(":")
+        if word:
+            return glued, _NUM_CASE_END_RE.sub("", word), tok.start()
+    return glued, "", start
+
+
+def _number_line_marks(text: str, start: int) -> str | None:
+    """The spaces, bullets and Markdown marks (#, >) between the line start
+    and the number at `start`, or None when the number does not open it."""
+    lo = max(0, start - 20)
+    nl = text.rfind("\n", lo, start)
+    if nl < 0 and lo:
+        return None
+    marks = text[nl + 1:start]
+    return None if marks.strip(" \t#>-*+•") else marks
+
+
+def _clock_minutes(m: re.Match) -> int | None:
+    """Minutes since midnight when a candidate reads as h.mm, else None."""
+    whole, frac = m.groups()
+    if len(whole) <= 2 and len(frac) == 2 and int(whole) <= 24 and int(frac) <= 59:
+        return int(whole) * 60 + int(frac)
+    return None
+
+
+def _decimal_skipped(text: str, cands: list[re.Match], i: int, known: dict[str, bool]) -> bool:
+    """True when candidate `i` is no English decimal, by the rules above."""
+    m = cands[i]
+    whole, frac = m.groups()
+    start, end = m.span()
+    after = text[end:end + 2]
+    if after[:1] == "," and after[1:].isdigit():
+        return True
+    glued, word, word_start = _number_before(text, start)
+    if glued.lstrip(_NUM_OPENERS) in ("v", "V") or (glued[-1:] == "-" and glued[-2:-1].isalpha()):
+        return True
+    final = after[:1] == "."
+    marks = _number_line_marks(text, start)
+    if marks is not None:
+        nxt = _NUM_NEXT_LETTER_RE.match(text, end)
+        if final or ("#" in marks and nxt and nxt.group(1).isupper()):
+            return True
+    # A number joined by a dash shares the unit and may close a time range.
+    left = cands[i - 1] if i and _NUM_RANGE_GAP_RE.fullmatch(text, cands[i - 1].end(), start) else None
+    right = (cands[i + 1] if i + 1 < len(cands)
+             and _NUM_RANGE_GAP_RE.fullmatch(text, end, cands[i + 1].start()) else None)
+    if any(_NUM_UNIT_RE.match(text, c.end())
+           or _NUM_CURRENCY_RE.search(text, max(0, c.start() - 5), c.start())
+           for c in (left, m, right) if c):
+        return False
+    low = word.lower()
+    here = _clock_minutes(m)
+    before = _clock_minutes(left) if left and here is not None else None
+    later = _clock_minutes(right) if right and here is not None else None
+    short = len(whole) <= 2 and len(frac) == 2
+    return (
+        _NUM_KELL_RE.fullmatch(low) is not None
+        or (before is not None and before < here) or (later is not None and here < later)
+        or _NUM_SECTION_RE.fullmatch(low) is not None or word == "lisa"
+        or (short and 1 <= int(whole) <= 31 and 1 <= int(frac) <= 12)  # a date
+        or (final and (word != low or (short and int(whole) <= 59 and int(frac) <= 59)))
+        or (word[:1].isupper() and not word.isupper() and word[-1].isalnum()  # a product
+            and not _NUM_SENTENCE_START_RE.search(text, max(0, word_start - 20), word_start)
+            and not _number_word_known(word, known)))
+
+
 def _check_numbers(text: str) -> dict:
-    """Phase-1 number-writing checker: separator rules only."""
+    """Number-writing checker: separator rules only."""
     _check_text(text)
-    import re
     issues: list[dict] = []
 
-    # Decimal with period instead of Estonian comma. Skip patterns that
-    # look like dates (\d+\.\d+\.\d+) or version numbers / IPs by
-    # excluding matches whose tail is followed by another period+digit.
-    for m in re.finditer(r"(?<![\d.])(\d+)\.(\d+)(?![\d.])", text):
-        # if followed by ".\d+" (date-like), skip
-        rest = text[m.end():]
-        if rest.startswith(".") and len(rest) > 1 and rest[1].isdigit():
+    # Thousands: only where the comma cannot be the Estonian decimal comma.
+    with_decimals: set[int] = set()
+    for m in _NUM_THOUSANDS_RE.finditer(text):
+        groups, decimals = m.groups()
+        if decimals is None and groups.count(",") < 2:
             continue
-        original = m.group(0)
-        corrected = f"{m.group(1)},{m.group(2)}"
+        if decimals is not None:
+            with_decimals.add(m.end())
         issues.append({
-            "text": original,
-            "position": m.start(),
-            "rule": "decimal-separator",
-            "rule_estonian": "kümnenduskoma",
-            "suggestion": corrected,
-        })
-
-    # Thousands separator using comma where Estonian uses a space.
-    # Matches \d{1,3}(,\d{3})+ where the grouping is exactly 3-digit
-    # blocks (real thousand separator), not a decimal like 3,14.
-    for m in re.finditer(r"(?<!\d)\d{1,3}(?:,\d{3})+(?!\d)", text):
-        original = m.group(0)
-        corrected = original.replace(",", " ")
-        issues.append({
-            "text": original,
+            "text": m.group(0),
             "position": m.start(),
             "rule": "thousands-separator",
             "rule_estonian": "tuhandeliste eraldaja",
-            "suggestion": corrected,
+            "suggestion": groups.replace(",", " ") + (f",{decimals}" if decimals else ""),
         })
 
+    cands = list(_NUM_DECIMAL_RE.finditer(text))
+    known: dict[str, bool] = {}
+    for i, m in enumerate(cands):
+        # 000.50 of 1,500,000.50 is part of the thousands issue.
+        if m.end() in with_decimals or _decimal_skipped(text, cands, i, known):
+            continue
+        issues.append({
+            "text": m.group(0),
+            "position": m.start(),
+            "rule": "decimal-separator",
+            "rule_estonian": "kümnenduskoma",
+            "suggestion": f"{m.group(1)},{m.group(2)}",
+        })
+
+    issues.sort(key=lambda d: d["position"])
     return {
         "issues": issues,
         "summary_estonian": (
@@ -2763,13 +3132,12 @@ def _check_numbers(text: str) -> dict:
 @_counted
 def check_numbers(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
     """Flags English-style number separators (numbrite õigekirjutus):
-    - `decimal-separator`: 3.14 → 3,14.
+    - `decimal-separator`: 3.14 → 3,14; skips kell 10.30, 14.05, punkt
+      3.2, Python 3.12, but flags a bare 10.30.
     - `thousands-separator`: 1,500,000 → 1 500 000 (ideally non-breaking
-      spaces; `suggestion` has plain ones).
+      spaces; `suggestion` has plain ones); 1,250 is a decimal.
 
-    No context is read: times, dates and section numbers (10.30, 14.05,
-    3.2) and three-place decimals (1,250 kg) can be flagged too. Spelling
-    out small numbers is not checked.
+    Spelling out small numbers is not checked.
     """
     return _check_numbers(text)
 
@@ -3896,10 +4264,32 @@ def _check_legalese(text: str) -> dict:
     }
 
 
-# Definition markers: '(edaspidi «Müüja»)', '(edaspidi ühiselt "Pooled")',
-# '(edaspidi nimetatud Leping)'.
+# Definition markers: '(edaspidi „Müüja“)', '(edaspidi ühiselt «Pooled»)',
+# '(edaspidi "Ostja")', '(edaspidi nimetatud Leping)'. Quotes pair loosely:
+# «…», „…“, „…”, “…”, ”…”, "…" and mixes of them; a doubled opener
+# ('««Leping»') is a typo and is skipped. The term holds no double quote
+# except a whole inner «…» ('„Programm «Kevad»“', the Estonian nesting),
+# so it ends at the first closing quote and never swallows one.
+# An unclosed opener ('(edaspidi «Müüja), ...') must not swallow the
+# definitions after it, so the term also stops at an unbalanced
+# parenthesis or the word 'edaspidi' and runs at most _DEF_TERM_MAX
+# characters (an inner «…» or (…) counting as one); past those it is no
+# definition at all.
+# “, ” and " also close a quotation, so as openers they need a space
+# before them or the term right after them: '„Teen seda edaspidi“, ütles
+# ta ja lisas “aitäh”' defines nothing.
+# Drafting puts 'edaspidi' right after '(' or ',' (see _introduces_term):
+# the adverb in 'lubas edaspidi „kõik võlad tasuda“' defines nothing.
+_DEF_QUOTES = "«»„“”\""
+_DEF_TERM_MAX = 150
+_DEF_CHAR = rf"[^{_DEF_QUOTES}()]"
 _EDASPIDI_QUOTED_RE = re.compile(
-    r"edaspidi(?:\s+ühiselt)?(?:\s+nimetatud)?\s*[«„\"“]\s*([^»\"”“]+?)\s*[»\"”]",
+    r"edaspidi(?:\s+ühiselt)?(?:\s+nimetatud)?"
+    r"(?:\s*[«„]+?|\s+[“”\"]|[“”\"](?=\w))"
+    # No \s* around the term: the caller strips it, and a \s* next to a
+    # lazy term makes an unclosed quote before a long blank run quadratic.
+    rf"((?:(?!edaspidi(?!\w)){_DEF_CHAR}|«{_DEF_CHAR}+»|\({_DEF_CHAR}*\))"
+    rf"{{1,{_DEF_TERM_MAX}}}?)[»“”\"]",
     re.IGNORECASE,
 )
 _EDASPIDI_BARE_RE = re.compile(
@@ -3912,11 +4302,68 @@ _XREF_RE = re.compile(
 )
 
 
-def _count_word_occurrences(term: str, text: str) -> int:
-    """Case-sensitive whole-token occurrence count, Estonian-letter aware
-    (Python \\b is ASCII-only, so use explicit non-letter boundaries)."""
-    pat = r"(?<![\wäöüõšžÄÖÜÕŠŽ])" + re.escape(term) + r"(?![\wäöüõšžÄÖÜÕŠŽ])"
-    return len(re.findall(pat, text))
+# Inner quotes around the whole term are double quoting, not part of the
+# name: „«Leping»“ and "'Leping'" define Leping. An apostrophe that ends
+# the name (Jones') or quotes a part of it (Kohvik 'Kodu') stays.
+_DEF_INNER_PAIRS = (("«", "»"), ("'", "'"), ("‘", "’"))
+
+
+def _unwrap_defined_term(term: str) -> str:
+    term = term.strip()
+    for o, c in _DEF_INNER_PAIRS:
+        if len(term) > 2 and term[0] == o and term[-1] == c and o not in term[1:-1]:
+            return term[1:-1].strip()
+    return term
+
+
+def _introduces_term(text: str, at: int) -> bool:
+    """Whether the 'edaspidi' at `at` follows '(' or ',', blanks allowed:
+    '(edaspidi „Leping“)', ', edaspidi „Leping“,'."""
+    return text[max(0, at - 20):at].rstrip().endswith(("(", ","))
+
+
+# Where a term can start: a whole word, or one character that is neither a
+# word character nor a blank (a term can begin with «).
+_TERM_START_RE = re.compile(r"(?<!\w)(?:\w+|[^\w\s])")
+# Where a term can end: no word character follows.
+_TERM_END_RE = re.compile(r"(?!\w)")
+
+
+def _count_terms(terms: list[str], text: str) -> dict[str, int]:
+    """Case-sensitive whole-token occurrences of each term, in one pass.
+
+    Each place a term can start tries only the terms that start the same
+    way, longest first, and the shorter terms that match begins with occur
+    there too ('Teenuse' inside 'Teenuse osutaja'). Scanning the text once
+    per term took seconds for a document with thousands of terms.
+    """
+    by_start: dict[str, list[str]] = {}
+    for t in terms:
+        by_start.setdefault(_TERM_START_RE.match(t).group(), []).append(t)
+    # Terms that start alike are tried in one regex; a regex for a term
+    # that starts alone would cost more to compile than it saves.
+    alike = {s: re.compile("(?:" + "|".join(map(re.escape, sorted(ts, key=len, reverse=True)))
+                           + r")(?!\w)")
+             for s, ts in by_start.items() if len(ts) > 1}
+    longest = dict.fromkeys(terms, 0)
+    for m in _TERM_START_RE.finditer(text):
+        start, at = m.group(), m.start()
+        if start in alike:
+            hit = alike[start].match(text, at)
+            if hit:
+                longest[hit.group()] += 1
+        elif start in by_start:
+            t = by_start[start][0]
+            if text.startswith(t, at) and _TERM_END_RE.match(text, at + len(t)):
+                longest[t] += 1
+    counts = dict.fromkeys(terms, 0)
+    for t, n in longest.items():
+        if n:
+            counts[t] += n
+            for k in range(1, len(t)):
+                if _TERM_END_RE.match(t, k) and t[:k] in counts:
+                    counts[t[:k]] += n
+    return counts
 
 
 def _check_defined_terms(text: str) -> dict:
@@ -3929,16 +4376,17 @@ def _check_defined_terms(text: str) -> dict:
     defs: dict[str, dict] = {}
     for rx in (_EDASPIDI_QUOTED_RE, _EDASPIDI_BARE_RE):
         for m in rx.finditer(text):
-            term = m.group(1).strip().strip("«»„“”\"' ")
-            if not term:
+            term = _unwrap_defined_term(m.group(1))
+            if not term or (rx is _EDASPIDI_QUOTED_RE and not _introduces_term(text, m.start())):
                 continue
             d = defs.setdefault(term, {"position": m.start(), "definitions": 0})
             d["definitions"] += 1
 
     issues: list[dict] = []
     defined_terms: list[dict] = []
+    counts = _count_terms(list(defs), text)
     for term, d in sorted(defs.items(), key=lambda kv: kv[1]["position"]):
-        uses = _count_word_occurrences(term, text)
+        uses = counts[term]
         defined_terms.append({
             "term": term, "position": d["position"],
             "definitions": d["definitions"], "total_occurrences": uses,

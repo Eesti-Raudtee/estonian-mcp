@@ -77,6 +77,16 @@ jobs:
       - name: Run HTTP smoke tests
         run: uv run --python ${{ matrix.python-version }} python tests/test_http.py
 
+      # Times, dates, section and version numbers must pass; the English
+      # separators must still flag. Uses Vabamorf only, no fetched resource.
+      - name: Run check_numbers context tests
+        run: uv run --python ${{ matrix.python-version }} python tests/test_numbers.py
+
+      # check_punctuation against the EKI comma rules for two-part
+      # connectives (nii et, ilma et, selleks et) and nagu comparisons.
+      - name: Run punctuation tests
+        run: uv run --python ${{ matrix.python-version }} python tests/test_punctuation.py
+
       - name: Run familiarity-verdict tests
         run: uv run --python ${{ matrix.python-version }} python tests/test_familiarity.py
 
