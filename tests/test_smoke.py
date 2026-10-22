@@ -41,6 +41,7 @@ print("tokenize")
 tok = server.tokenize(SAMPLE)
 check("returns sentences+words", "sentences" in tok and "words" in tok)
 check("non-empty words", len(tok["words"]) >= 6)
+check("keeps punctuation", tok["words"][-1] == ".", str(tok["words"]))
 
 print("lemmatize")
 lem = server.lemmatize("Mina sõin täna hommikul Tallinnas putru.")
@@ -48,25 +49,90 @@ lemmas = {row["lemma"] for row in lem}
 check("recognises 'sööma'", "sööma" in lemmas, str(lemmas))
 check("recognises 'Tallinn'", "Tallinn" in lemmas, str(lemmas))
 check("recognises 'puder'", "puder" in lemmas, str(lemmas))
+check("every entry keeps word and lemma, even when they match",
+      all(set(row) == {"word", "lemma"} for row in lem)
+      and {"word": "täna", "lemma": "täna"} in lem, str(lem))
+check("punctuation is omitted", [row["word"] for row in lem]
+      == ["Mina", "sõin", "täna", "hommikul", "Tallinnas", "putru"], str(lem))
 
 print("pos_tag")
 pos = server.pos_tag(SAMPLE)
 check("first tokens are non-empty POS", all(row["partofspeech"] for row in pos[:5]))
+pos = server.pos_tag("Ta pani plehku, aga § 2 jäi :) alles.")
+tags = {row["word"]: row["partofspeech"] for row in pos}
+check("no punctuation or emoticon entries", not any(t == "Z" for t in tags.values())
+      and not {",", ":)", "."} & set(tags), str(pos))
+check("a symbol is kept as Y", tags.get("§") == "Y", str(tags))
+# Vabamorf tags any word of 40+ characters Z without analysing it. It is a
+# word, not punctuation, so the per-token tools must keep it.
+LONG = "andmekaitseinspektsioonipeadirektoriasetäitjale"
+long_text = f"Kiri saadeti {LONG} eile."
+check("a 40+ character word is kept by pos_tag, as Z",
+      {"word": LONG, "partofspeech": "Z"} in server.pos_tag(long_text), long_text)
+check("and by lemmatize", LONG in [r["word"] for r in server.lemmatize(long_text)])
+check("and by analyze_morphology",
+      [r["word"] for r in server.analyze_morphology(LONG)] == [LONG])
+check("while the full stop after it is still left out",
+      "." not in [r["word"] for r in server.lemmatize(long_text)])
+check("'plehku' is X, the verb-bound word", tags.get("plehku") == "X", str(tags))
 
 print("analyze_morphology")
 morph = server.analyze_morphology("Tere maailm!")
-check("compound 'maailm' splits", any(row.get("root_tokens") == ["maa", "ilm"] for row in morph))
-check(
-    "ambiguity surfaced via analyses_count + is_ambiguous fields",
-    all("analyses_count" in row and "is_ambiguous" in row for row in morph),
-)
+by_word = {row["word"]: row for row in morph}
+check("compound 'maailm' splits", by_word.get("maailm", {}).get("root_tokens") == ["maa", "ilm"], str(morph))
+check("a one-part root has no root_tokens", "root_tokens" not in by_word.get("Tere", {"root_tokens": 0}),
+      str(by_word.get("Tere")))
+check("'!' is omitted", list(by_word) == ["Tere", "maailm"], str(morph))
+check("form_estonian only where the form has a name",
+      by_word["maailm"].get("form_estonian") == "ainsuse nimetav"
+      and "form_estonian" not in by_word["Tere"] and by_word["Tere"]["form"] == "", str(morph))
+amb = {row["word"]: row.get("analyses_count", 1) for row in server.analyze_morphology("Ta on kodus.")}
+check("analyses_count only on ambiguous words, no is_ambiguous",
+      amb.get("on", 0) > 1 and amb.get("kodus") == 1
+      and not any("is_ambiguous" in row for row in morph), str(amb))
+both = server.analyze_morphology("Ta on kodus.", all_analyses=True)
+check("all_analyses carries no analyses_count",
+      not any("analyses_count" in row or "is_ambiguous" in row for row in both)
+      and len(next(row for row in both if row["word"] == "on")["analyses"]) > 1, str(both))
+clit = {row["word"]: row.get("clitic") for row in server.analyze_morphology("Kas sinagi tuled?")}
+check("clitic only where there is one", clit == {"Kas": None, "sinagi": "gi", "tuled": None}, str(clit))
+plehku = next((row for row in server.analyze_morphology("Ta pani plehku.") if row["word"] == "plehku"), {})
+check("'plehku' is X and not flagged foreign",
+      plehku.get("partofspeech") == "X" and "usage_note" not in plehku
+      and "usage_note_estonian" not in plehku, str(plehku))
+
+
+def _empty_values(node, key=""):
+    """Every (key, value) in the output that is None or False, or "" or []
+    outside `form`, which is "" for every uninflected word."""
+    if isinstance(node, list):
+        if not node and key != "form":
+            return [(key, node)]
+        return [hit for item in node for hit in _empty_values(item, key)]
+    if isinstance(node, dict):
+        return [hit for k, v in node.items() for hit in _empty_values(v, k)]
+    if node is None or node is False or (node == "" and key != "form"):
+        return [(key, node)]
+    return []
+
+
+probe = ("Tere maailm! Kas sinagi tuled? Ta pani plehku. Ma ei tea. Okei, tarvitan "
+         "täis pudelit ja tuntud laulja. § 2 lõige 3, :) Riigid on suured.")
+for mode in (False, True):
+    empty = _empty_values(server.analyze_morphology(probe, all_analyses=mode))
+    check(f"no null, false or empty value (all_analyses={mode})", not empty, str(empty[:5]))
 # indeclinable flag: lexical indeclinable + -tud/-nud participle = True,
-# normal declinable adjective = False.
+# normal declinable adjective = absent.
 r = server.analyze_morphology("täis pudel tuntud laulja kollane lill")
-flags = {row["word"]: row.get("indeclinable") for row in r}
+flags = {row["word"]: row.get("indeclinable", False) for row in r}
 check("'täis' flagged indeclinable", flags.get("täis") is True, str(flags))
 check("'tuntud' (-tud participle) flagged indeclinable", flags.get("tuntud") is True, str(flags))
 check("'kollane' NOT indeclinable", flags.get("kollane") is False, str(flags))
+check("indeclinable present only as true",
+      all(row.get("indeclinable", True) is True for row in r)
+      and "indeclinable" not in next(row for row in r if row["word"] == "kollane"), str(r))
+check("no usage notes on a neutral word",
+      not any("usage_note" in row or "usage_note_estonian" in row for row in r), str(r))
 # Marked-usage lexicon: 'tarvitama' should be tagged archaic.
 r = server.analyze_morphology("Ma tarvitan programmi.")
 tarv = next((row for row in r if row.get("lemma") == "tarvitama"), None)
@@ -99,6 +165,7 @@ check("verb paradigm has past 1sg", verb_forms.get("sin") == "kasutasin")
 check("verb paradigm has nud-participle", verb_forms.get("nud") == "kasutanud")
 p = server.paradigm("ja")
 check("non-inflecting word returns empty forms", p["forms"] == [], str(p))
+check("and says why", bool(p.get("summary_estonian")), str(p))
 try:
     server.paradigm("two words")
     check("paradigm rejects whitespace", False, "no exception")
@@ -109,8 +176,17 @@ print("spell_check")
 sp = server.spell_check(SAMPLE)
 bad = [row for row in sp if not row["spelling"]]
 check("flags 'sõinn' as misspelled", any(row["text"] == "sõinn" for row in bad))
-suggestions = next((row["suggestions"] for row in bad if row["text"] == "sõinn"), [])
+suggestions = next((row.get("suggestions", []) for row in bad if row["text"] == "sõinn"), [])
 check("suggests 'sõin'", "sõin" in suggestions, str(suggestions))
+check("lists only the misspelled tokens", [row["text"] for row in sp] == ["sõinn"]
+      and all(row["spelling"] is False for row in sp), str(sp))
+check("clean text gives an empty list", server.spell_check("Tere maailm.") == [],
+      str(server.spell_check("Tere maailm.")))
+twice = server.spell_check("sõinn ja sõinn")
+check("each occurrence is listed", [row["text"] for row in twice] == ["sõinn", "sõinn"], str(twice))
+check("no suggestions key when there are none",
+      server.spell_check("sõinn", suggestions=False) == [{"text": "sõinn", "spelling": False}],
+      str(server.spell_check("sõinn", suggestions=False)))
 
 print("syllabify")
 syl = server.syllabify("hommikul")
@@ -127,6 +203,7 @@ check("ORG detected", "ORG" in types)
 print("find_related_words")
 related = server.find_related_words("kohv", n=5)
 check("returns 5 matches", len(related["matches"]) == 5)
+check("does not echo the input word", set(related) == {"matches"}, str(sorted(related)))
 check(
     "match shape",
     all("word" in m and "score" in m for m in related["matches"]),
@@ -154,6 +231,28 @@ syn = server.synonyms("kasutama")
 check("returns synsets", syn["synset_count"] > 0)
 flat_lemmas = {lemma for s in syn["synsets"] for lemma in s["lemmas"]}
 check("recognises 'tarvitama' as a synonym", "tarvitama" in flat_lemmas, str(flat_lemmas))
+check("does not echo the input word", set(syn) == {"synsets", "synset_count"}, str(sorted(syn)))
+# The POS is the second-to-last dot segment of `name` (a literal can hold a
+# dot itself, "1."), so `pos` is not repeated; `examples` only when WordNet
+# has some.
+check("synsets carry name and lemmas, no pos",
+      all({"name", "lemmas"} <= set(s) and "pos" not in s
+          and s["name"].rsplit(".", 2)[1] in {"n", "v", "a", "r"}
+          for s in syn["synsets"]),
+      str(syn["synsets"][:2]))
+# Some synsets have no gloss (lahe.a.02): `definition` is then omitted,
+# never null.
+lahe = server.synonyms("lahe", max_synsets=20)["synsets"]
+check("definition is present when WordNet has a gloss and never null",
+      any("definition" in s for s in syn["synsets"])
+      and all(s.get("definition", "x") for s in lahe)
+      and any("definition" not in s for s in lahe),
+      str([(s["name"], s.get("definition")) for s in lahe]))
+korpus = server.synonyms("korpus", max_synsets=10)["synsets"]
+check("examples is omitted when empty and present when not",
+      all(s.get("examples", ["x"]) for s in korpus)
+      and any("examples" in s for s in korpus) and any("examples" not in s for s in korpus),
+      str([(s["name"], s.get("examples")) for s in korpus]))
 try:
     server.synonyms("two words")
     check("synonyms rejects whitespace", False, "no exception")
@@ -187,6 +286,11 @@ check("3-syllable word → 2 break points", len(r["breaks"]) == 2, str(r["breaks
 check("preferred uses interpunct", "·" in r["preferred"], r["preferred"])
 short = server.check_hyphenation("on")
 check("too-short word → no breaks", short["breaks"] == [], str(short))
+check("hyphenation returns breaks, preferred and syllable_count only",
+      set(r) == set(short) == {"breaks", "preferred", "syllable_count"},
+      f"{sorted(r)} {sorted(short)}")
+check("a too-short word is told apart by its syllable count",
+      short["syllable_count"] < 2 and short["preferred"] == "on", str(short))
 try:
     server.check_hyphenation("two words")
     check("rejects whitespace", False, "no exception")
@@ -219,10 +323,53 @@ check("mõtteliin flagged as suspect",
       str(r["suspect_compounds"]))
 check("wordnet_checked reported", isinstance(r["wordnet_checked"], bool),
       str(r.get("wordnet_checked")))
+check("suspect_compounds lists the lemma", r["suspect_compounds"] == ["mõtteliin"],
+      str(r["suspect_compounds"]))
+check("unattested_compounds lists the lemma", r["unattested_compounds"] == ["mõtteliin"],
+      str(r["unattested_compounds"]))
+check("the input is not echoed", "text" not in r, str(sorted(r)))
+# A note only says WordNet gave no answer for an unattested compound, so
+# where WordNet is installed there is none here; where it is not, there is.
+if r["wordnet_checked"]:
+    check("no note with WordNet consulted", "note" not in r, str(r.get("note")))
+else:
+    check("WordNet unavailable: a note says so",
+          "WordNet was unavailable" in (r.get("note") or ""), str(r.get("note")))
+mt = next((c for c in r["all_compounds"] if c["lemma"] == "mõtteliin"), {})
+check("no keys that repeat neighbours[0] or the gate",
+      mt and not {"top_score", "top_neighbour", "reasons"} & set(mt), str(mt))
+check("neighbour_quality carries only the signal",
+      mt.get("neighbour_quality") == {"signal": "usable"}, str(mt))
+_cap = server._FAMILIARITY_WORDNET_CAP
+server._FAMILIARITY_WORDNET_CAP = 0
+try:
+    r = server.check_compound_familiarity("See on mõtteliin.")
+    check("an unconsulted WordNet is noted",
+          ("`in_wordnet` is null" if r["wordnet_checked"] else "WordNet was unavailable")
+          in (r.get("note") or ""), str(r.get("note")))
+    r = server.check_compound_familiarity("Käisin raamatukogus.")
+    check("no note when every compound is attested anyway", "note" not in r,
+          str(r.get("note")))
+finally:
+    server._FAMILIARITY_WORDNET_CAP = _cap
+_wn = server._wordnet_available
+server._wordnet_available = lambda: False
+try:
+    r = server.check_compound_familiarity("See on mõtteliin.")
+    check("WordNet off: the note says it was unavailable",
+          r["wordnet_checked"] is False
+          and "WordNet was unavailable" in (r.get("note") or ""), str(r.get("note")))
+    r = server.check_compound_familiarity("Käisin raamatukogus.")
+    check("WordNet off, all attested: no note", "note" not in r, str(r.get("note")))
+finally:
+    server._wordnet_available = _wn
 r = server.check_compound_familiarity("Käisin raamatukogus ja koolimajas.")
 check("real compounds analysed", r["compounds_analysed"] == 2)
 check("real compounds NOT suspect", len(r["suspect_compounds"]) == 0,
       str(r["suspect_compounds"]))
+check("attested compounds carry no neighbours",
+      all("neighbours" not in c and "neighbour_quality" not in c
+          for c in r["all_compounds"]), str(r["all_compounds"]))
 # Regression, the false positives that cost the gate its credibility:
 # `lisakäive` (junk top neighbour at 0.670) and `klikkimismäär` (clean
 # neighbourhood, 0.586) are both ordinary business Estonian and both were
@@ -239,8 +386,8 @@ for lemma in ("lisakäive", "klikkimismäär"):
     if c:
         check(f"{lemma} NOT flagged suspect", c["is_suspect"] is False, str(c))
         check(f"{lemma} reported unattested", c["attested"] is False, str(c))
-check("unattested_compounds lists both",
-      len(r["unattested_compounds"]) == 2, str(r["unattested_compounds"]))
+check("unattested_compounds lists both lemmas",
+      r["unattested_compounds"] == ["lisakäive", "klikkimismäär"], str(r["unattested_compounds"]))
 check("suspect_compounds empty", r["suspect_compounds"] == [],
       str(r["suspect_compounds"]))
 # `lisakäive`'s nearest neighbour is a scrape-artifact token, so the
@@ -261,7 +408,7 @@ if tt:
     check("toortõlkeoht reported unattested", tt["attested"] is False, str(tt))
     check("toortõlkeoht has neighbour_quality",
           isinstance(tt.get("neighbour_quality"), dict)
-          and "scrape_junk" in tt["neighbour_quality"]
+          and set(tt["neighbour_quality"]) == {"signal"}
           and tt["neighbour_quality"].get("signal") in ("none", "usable"),
           str(tt))
 r = server.check_compound_familiarity("Eile käisin poes ja ostsin leiba.")
@@ -277,13 +424,16 @@ if sv:
     check("legal term NOT flagged suspect", sv["is_suspect"] is False, str(sv))
     check("legal de-noise marked in quality",
           sv.get("neighbour_quality", {}).get("legal_term") is True, str(sv))
+    check("an attested legal term keeps only that marker",
+          sv.get("neighbour_quality") == {"legal_term": True} and "neighbours" not in sv,
+          str(sv))
 r = server.check_compound_familiarity(
     "See on mõtteliin."
 )
 for c in r["all_compounds"]:
     if c["lemma"] == "mõtteliin":
         check("neighbours list populated", len(c["neighbours"]) > 0, str(c))
-        check("top_score is float", isinstance(c["top_score"], float))
+        check("neighbour score is float", isinstance(c["neighbours"][0]["score"], float))
         break
 
 print("check_abbreviation_hyphenation")
@@ -309,6 +459,13 @@ r = server.check_abbreviation_hyphenation("Lugesin MCPst.")
 check("rule_estonian populated",
       all(i.get("rule_estonian") for i in r["issues"]),
       str([i.get("rule_estonian") for i in r["issues"]]))
+# The description promises this scope: any all-capital stem counts, known
+# or not, and a mixed-case stem is never checked. Change both together.
+r = server.check_abbreviation_hyphenation("XYZQst tuli abi.")
+check("unknown all-caps stem flagged",
+      [i["suggestion"] for i in r["issues"]] == ["XYZQ-st"], str(r["issues"]))
+r = server.check_abbreviation_hyphenation("Kasutame SaaSi.")
+check("mixed-case stem not checked", r["issues"] == [], str(r["issues"]))
 
 print("check_object_case")
 # Negation rule
@@ -351,6 +508,21 @@ check("proper noun not flagged", len(prop["issues"]) == 0, str(prop["issues"]))
 r = server.check_object_case("Ma ei söönud leib.")
 check("rule_estonian present on each issue",
       all(i.get("rule_estonian") for i in r["issues"]))
+# The description tells the caller the fix is the partitive of `lemma` in
+# the number `form` shows, so both must be there, plural included.
+r = server.check_object_case("Ma ei söönud leivad.")
+check("plural object: lemma and plural form given",
+      [(i["lemma"], i["form"]) for i in r["issues"]] == [("leib", "pl n")],
+      str(r["issues"]))
+# The description says the negation rule skips a sentence with olema in
+# it, and only that rule. Change both together.
+r = server.check_object_case("Ma pole söönud leib.")
+check("negated olema sentence: negation rule skipped", r["issues"] == [],
+      str(r["issues"]))
+r = server.check_object_case("Ma ei ole armastanud koogi.")
+check("negated olema sentence: partitive-only verb still checked",
+      [i["rule"] for i in r["issues"]] == ["partitive-only-verb"],
+      str(r["issues"]))
 
 print("check_redundancy")
 # The exact case from the field: "Samuti ka suvesärgid" (samuti + ka
@@ -397,6 +569,14 @@ check("sentence_length has mean+stddev",
 check("all four sub-checks have Estonian summary",
       all(r[k].get("summary_estonian") for k in
           ("repetition", "passive_voice", "sentence_length", "hedging")))
+check("no input echo or static note", "text" not in r and "note" not in r,
+      str(sorted(r)))
+lemmas = [x["lemma"] for x in r["repetition"]["repeated_lemmas"]]
+check("repetition summary names the lemmas as a plain list",
+      lemmas and r["repetition"]["summary_estonian"].endswith(
+          ": " + ", ".join(lemmas) + ".")
+      and "[" not in r["repetition"]["summary_estonian"],
+      r["repetition"]["summary_estonian"])
 clean = "Eile käisin kinos. Film oli huvitav ja näitlejad mängisid hästi."
 r = server.check_style(clean)
 check("clean copy: no passive flagged", r["passive_voice"]["passive_count"] == 0)
@@ -455,12 +635,57 @@ check(
     str([i.get("rule_estonian") for i in r["issues"]]),
 )
 
+print("issue-list checks: result shape")
+# A result is `issues` plus `summary_estonian`: no echo of the input, no
+# static note. Each issue keeps rule, rule_estonian and suggestion (object
+# case: lemma and form instead); only check_redundancy keeps an
+# `explanation`, because its Estonian reason is not in any other field.
+_SHAPE_CALLS = {
+    "check_compounds": "Kooli maja on suur.",
+    "check_punctuation": "Ma tean et see on hea.",
+    "check_capitalization": "Olen Eestlane.",
+    "check_numbers": "See maksis 3.14 eurot.",
+    "check_redundancy": "Samuti ka. See on kõige optimaalsem. Pikk ajaline periood.",
+    "check_object_case": "Ma ei söönud leib. Ma armastan koogi.",
+    "check_abbreviation_hyphenation": "MCPst tuleb abi.",
+}
+for _name, _text in _SHAPE_CALLS.items():
+    r = getattr(server, _name)(_text)
+    check(f"{_name}: only issues and summary_estonian",
+          set(r) == {"issues", "summary_estonian"}, str(sorted(r)))
+    check(f"{_name}: the sample has issues", bool(r["issues"]), str(r))
+    check(f"{_name}: every issue has rule and rule_estonian",
+          all(i.get("rule") and i.get("rule_estonian") for i in r["issues"]),
+          str(r["issues"]))
+    check(f"{_name}: no suggestion_hint",
+          not any("suggestion_hint" in i for i in r["issues"]), str(r["issues"]))
+    if _name == "check_redundancy":
+        check(f"{_name}: every issue keeps its Estonian explanation",
+              all(i.get("explanation") for i in r["issues"]), str(r["issues"]))
+        check(f"{_name}: all three rules in the sample",
+              {i["rule"] for i in r["issues"]}
+              == {"doubled-also", "double-superlative", "fixed-pleonasm"},
+              str(r["issues"]))
+    else:
+        check(f"{_name}: no explanation",
+              not any("explanation" in i for i in r["issues"]), str(r["issues"]))
+    if _name == "check_object_case":
+        check(f"{_name}: lemma and form on every issue, verb on the verb rule",
+              all(i.get("lemma") and i.get("form") for i in r["issues"])
+              and all(("verb" in i) == (i["rule"] == "partitive-only-verb")
+                      for i in r["issues"]),
+              str(r["issues"]))
+    else:
+        check(f"{_name}: every issue has a suggestion",
+              all(i.get("suggestion") for i in r["issues"]), str(r["issues"]))
+
 print("classify_register")
 formal = server.classify_register(
     "Käesoleva lepingu alusel sätestatakse poolte kohustused vastavalt "
     "määratletud tingimustele."
 )
 check("formal text → formal tier", formal["tier"] == "formal", formal["tier"])
+check("no static note", "note" not in formal, str(sorted(formal)))
 check("formal text → positive score", formal["score"] > 0)
 check(
     "formal text → tier_estonian='formaalne' (not the *formalne hallucination)",

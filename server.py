@@ -26,6 +26,7 @@ import collections
 import difflib
 import hashlib
 import heapq
+import inspect
 import json
 import logging
 import os
@@ -38,9 +39,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
+import pydantic_core
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
-from pydantic import Field, StringConstraints
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import TextContent, ToolAnnotations
+from mcp.types import Tool as MCPTool
+from pydantic import Field, StringConstraints, ValidationError
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -87,7 +91,7 @@ DEFAULT_STATIC_RATE_LIMIT_PER_MINUTE = 60
 _TRUSTED_PROXY_HOPS = max(0, int(os.environ.get("ESTNLTK_MCP_TRUSTED_PROXY_HOPS", "1")))
 
 # Bumped manually in lockstep with pyproject.toml's [project].version.
-SERVER_VERSION = "0.7.1"
+SERVER_VERSION = "0.8.0"
 
 # Favicons served alongside the MCP endpoint so Google's favicon service
 # (used by the Anthropic Connectors Directory + tool-call UI in Claude)
@@ -166,56 +170,155 @@ log = logging.getLogger("estonian-mcp")
 # read as the server description, and which gives an LLM client context
 # on what the server is for and how to use it.
 SERVER_INSTRUCTIONS = (
-    "Estonian NLP tools for AI agents that write, edit, or proofread "
-    "Estonian. Provides spell-check, morphological analysis, lemmatization, "
-    "POS tagging, tokenization, syllabification, named-entity recognition, "
-    "WordNet synonyms, fastText related words, full inflection paradigms, and "
-    "EKI-Reeglid orthography checks (capitalization, compound writing, "
-    "commas, number formatting, abbreviation hyphenation), plus object-case, "
-    "register, style, redundancy, compound-attestation and domain-glossary "
-    "checks. For legal "
-    "Estonian, "
-    "check_legalese aids plain-language simplification while listing the "
-    "terms of art that must be preserved, check_defined_terms maps "
-    "defined terms and cross-references in long documents, and "
-    "common_legal_usage returns canonical legal collocations for a term so "
-    "you use real legalese instead of inventing phrasings. "
-    "Use these tools as ground truth rather than guessing Estonian spelling, "
-    "case forms, or inflections: language models routinely hallucinate "
-    "plausible-but-wrong Estonian morphology. When you call paradigm and the "
-    "word has several inflection types (paradigm_count > 1, e.g. kott, which "
-    "inflects as either koti or kota, two different words sharing a "
-    "nominative), read ambiguity_estonian before quoting a form, and prefer "
-    "passing an INFLECTED form (koti) over the bare lemma, which selects the "
-    "type you mean. Note that spell_check passing "
-    "does NOT prove a word is real Estonian: Vabamorf accepts any "
-    "morphologically valid compound, including ones you just coined, so "
-    "check a compound YOU coined with check_compound_familiarity, which "
-    "asks two lexicons whether the lemma is attested, and read its "
-    "`attested: false` as 'outside a 100K-word vocabulary', the normal "
-    "state for specialist terms, not as 'invented'. Writing about an "
-    "organisation's own systems? check_domain_terms reports the compounds "
-    "that neither the lexicons nor the organisation's glossary vouch for "
-    "(pass its terms in `glossary` when the server has none), with "
-    "glossary terms spelled alike as suggestions, which are look-alikes, "
-    "not synonyms. "
-    "REACH FOR THESE TOOLS ON EDITORIAL QUESTIONS TOO, not just mechanical "
-    "ones. 'Is this the right word here?' → synonyms, and read each "
-    "definition's domain constraint against the context rather than "
-    "trusting the word's ML-jargon familiarity. 'Make this read more "
-    "human' / 'this is too bureaucratic' → check_officialese for "
-    "kantseliit in reports, academic and business prose (check_legalese "
-    "is for statutes and stays silent on those), plus check_style for "
-    "umbisikuline tegumood and rhythm. 'Keep the terminology "
-    "consistent across this document' → check_term_consistency. A word "
-    "can be correctly spelled, morphologically valid and still the wrong "
-    "register or the wrong term for its domain. The mechanical checks "
-    "will not tell you that. All tools are read-only and "
-    "operate on Estonian text; results are returned in UTF-8 (preserve "
-    "õ/ä/ö/ü/š/ž)."
+    "Estonian NLP for agents that write, edit or proofread Estonian: "
+    "spelling, morphology, inflection paradigms, synonyms, EKI-Reeglid "
+    "orthography checks, and register, style, terminology and legal checks. "
+    "Treat the results as ground truth rather than guessing spelling, case "
+    "forms or inflections: models routinely produce plausible but wrong "
+    "Estonian morphology. A spell_check pass does not prove a word is real "
+    "Estonian (Vabamorf accepts any well-formed compound, including ones you "
+    "coin), so check compounds you coined with check_compound_familiarity. "
+    "For text about an organisation's own systems, check_domain_terms reports "
+    "the compounds that neither the lexicons nor its glossary vouch for (pass "
+    "its terms in glossary when the server has none). Legal Estonian: "
+    "check_legalese is a plain-language aid that lists the terms of art to "
+    "keep, check_defined_terms maps defined terms and cross-references in "
+    "long documents, and common_legal_usage gives canonical collocations so "
+    "you do not invent legal phrasing. "
+    "REACH FOR THESE TOOLS ON EDITORIAL QUESTIONS TOO. 'Right word here?': "
+    "synonyms. 'Too bureaucratic', 'make it read more human': "
+    "check_officialese for kantseliit in reports, academic and business "
+    "prose (check_legalese is for statutes and stays silent on those), plus "
+    "check_style for umbisikuline tegumood and rhythm. 'Keep the terminology "
+    "consistent': check_term_consistency. A correctly spelled, well-formed "
+    "word can still be the wrong register or the wrong term for its domain, "
+    "and the mechanical checks cannot tell you that. "
+    "The check_* issue lists are heuristics: a hit is a candidate to verify, "
+    "not a verdict, and an empty list means nothing was found in that "
+    "check's scope, not that the text is correct. In Estonian replies, quote "
+    "the *_estonian labels, rules and summaries (form_estonian, "
+    "rule_estonian, summary_estonian) verbatim instead of translating the "
+    "English codes. A result field that does not apply is omitted. Text "
+    f"inputs are capped at {MAX_TEXT_CHARS:,} characters (check_defined_terms: "
+    f"{MAX_DOC_CHARS:,}) and single words at {MAX_WORD_CHARS}. All tools are "
+    "read-only and make no outbound calls; results are UTF-8, so keep "
+    "õ ä ö ü š ž intact."
 )
 
-mcp = FastMCP("estonian-mcp", instructions=SERVER_INSTRUCTIONS)
+# Keys whose value maps NAMES to subschemas. A property called "title" is
+# data, not the annotation, so these are walked name by name.
+_SCHEMA_NAME_MAPS = ("properties", "$defs", "definitions", "patternProperties")
+
+
+def _lean_schema(node: Any, *, output: bool) -> Any:
+    """Drop JSON Schema annotations that change no validation result: every
+    `title` (pydantic's "Text", "tokenizeArguments"), and in output schemas
+    `default: null` and `additionalProperties: true`, which restate the JSON
+    Schema defaults. Input defaults stay: they tell the model what leaving
+    an argument out means."""
+    if isinstance(node, list):
+        return [_lean_schema(x, output=output) for x in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "title" and isinstance(value, str):
+            continue
+        if output and ((key == "default" and value is None)
+                       or (key == "additionalProperties" and value is True)):
+            continue
+        if key in _SCHEMA_NAME_MAPS and isinstance(value, dict):
+            out[key] = {name: _lean_schema(sub, output=output) for name, sub in value.items()}
+        else:
+            out[key] = _lean_schema(value, output=output)
+    return out
+
+
+# Argument errors list at most this many fields. A glossary of 1,000
+# over-long terms is 1,000 errors, and each would cost the caller tokens.
+_MAX_ARG_ERRORS = 5
+
+_LIST_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s")
+
+
+def _reflow(doc: str) -> str:
+    """A docstring as the client should get it: dedented (Python 3.13 does
+    that to __doc__, 3.10 to 3.12 do not), with each paragraph and list item
+    on one line. Hard wrapping at 72 columns costs about 5% more tokens and
+    tells the model nothing."""
+    paragraphs = []
+    for block in re.split(r"\n\s*\n", inspect.cleandoc(doc)):
+        lines: list[str] = []
+        for raw in block.splitlines():
+            line = raw.strip()
+            if lines and not _LIST_ITEM.match(line):
+                lines[-1] += " " + line
+            else:
+                lines.append(line)
+        paragraphs.append("\n".join(lines))
+    return "\n\n".join(paragraphs)
+
+
+class _EstonianMCP(FastMCP):
+    """FastMCP with a leaner wire format. Tools and validation are unchanged.
+
+    Every caller pays for what crosses the wire in tokens: the tool list on
+    every turn, each result once it is read. Claude Code, Codex and VS Code
+    show the model structuredContent; Cursor shows the text content; ChatGPT
+    shows both. So both are kept lean:
+
+    * tools/list: schemas without `title` noise (see _lean_schema), and
+      descriptions without hard wrapping (see _reflow).
+    * tools/call: ONE text block of compact JSON built from the tool's own
+      return value. The SDK default is one indent=2 block per list item,
+      so a 100-word spell_check came back as 97 blocks. structuredContent
+      keeps exactly the keys the tool returned; the SDK default fills every
+      declared-but-absent key with null. The lowlevel server still
+      validates structuredContent against the advertised outputSchema.
+    * argument errors: one clause per field (at most _MAX_ARG_ERRORS),
+      without pydantic's docs URL or a repr of the caller's input.
+    """
+
+    async def list_tools(self) -> list[MCPTool]:
+        tools = await super().list_tools()
+        for t in tools:
+            if t.description:
+                t.description = _reflow(t.description)
+            t.inputSchema = _lean_schema(t.inputSchema, output=False)
+            if t.outputSchema is not None:
+                t.outputSchema = _lean_schema(t.outputSchema, output=True)
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            raise ToolError(f"Unknown tool: {name}")
+        meta = tool.fn_metadata
+        try:
+            raw = await tool.run(arguments, context=self.get_context(), convert_result=False)
+        except ToolError as e:
+            cause = e.__cause__
+            if isinstance(cause, ValidationError) and cause.title == meta.arg_model.__name__:
+                errors = cause.errors(include_url=False, include_input=False)
+                shown = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}"
+                                  for err in errors[:_MAX_ARG_ERRORS])
+                more = len(errors) - _MAX_ARG_ERRORS
+                if more > 0:
+                    shown += f"; and {more} more"
+                raise ToolError(f"Input validation error: {shown}") from cause
+            raise
+        if meta.output_model is None or not isinstance(raw, (dict, list)):
+            return meta.convert_result(raw)  # not this server's shape: SDK default
+        # Compact, keeps õäöü, and NaN/inf become null as in structuredContent
+        # (a bare NaN is not JSON, and a strict client would reject the block).
+        text = pydantic_core.to_json(raw, fallback=str, inf_nan_mode="null").decode()
+        payload = {"result": raw} if meta.wrap_output else raw
+        structured = meta.output_model.model_validate(payload).model_dump(
+            mode="json", by_alias=True, exclude_unset=True)
+        return [TextContent(type="text", text=text)], structured
+
+
+mcp = _EstonianMCP("estonian-mcp", instructions=SERVER_INSTRUCTIONS)
 # FastMCP's constructor doesn't accept a server-version kwarg, so reach
 # into the underlying MCPServer to override the SDK-default version that
 # would otherwise show up in `initialize` responses (and Smithery's UI).
@@ -547,9 +650,9 @@ _MARKED_LEMMAS_ET: dict[str, tuple[str, str]] = {
 
 # POS-tag-based usage notes. Maps Vabamorf POS codes that signal
 # non-routine usage. Skipped: S/V/A/P/D/K/J/N/Z (standard parts of
-# speech, no special flag).
+# speech, no special flag) and X, which is a verb-bound word (`plehku`
+# in `pani plehku`), not a foreign one.
 _POS_USAGE_NOTES_ET: dict[str, tuple[str, str]] = {
-    "X": ("foreign", "võõrsõna või tundmatu sõna"),
     "Y": ("abbreviation", "lühend"),
     "I": ("interjection", "interjektsioon"),
     "H": ("proper-noun", "pärisnimi"),
@@ -983,6 +1086,19 @@ def _first(values: list[Any] | None) -> Any:
     return values[0]
 
 
+def _is_punct(span) -> bool:
+    """True when every Vabamorf reading of a morph_analysis span is Z and
+    the span has no letter or digit: punctuation, operators (+ = /) and
+    emoticons such as `:)`. Vabamorf also tags any word of 40 or more
+    characters Z without analysing it (andmekaitseinspektsiooni...), and
+    that is a word, so it is kept. Symbols (§, €) are Y and are kept.
+    lemmatize, pos_tag and analyze_morphology leave these out; tokenize
+    keeps them."""
+    pos = list(span.partofspeech)
+    return (bool(pos) and all(p == "Z" for p in pos)
+            and not any(ch.isalnum() for ch in span.text))
+
+
 # Olema-forms (plus the negative 'pole' family) that turn a following -tud
 # participle into an impersonal predicate rather than a modifier:
 # 'on kasutatud andmeid' (impersonal) vs 'lukustatud hindamisosa'
@@ -1156,57 +1272,44 @@ class _TokenizeResult(TypedDict, total=False):
 
 
 class _ParadigmResult(TypedDict, total=False):
-    # EVERY conditional field is nullable, and that is not cosmetic.
-    # `total=False` says a key may be absent, but the MCP layer builds its
-    # structured payload from this schema and fills each declared-but-
-    # absent key with None before validating. A field typed `str` then
-    # fails validation as "None is not of type 'string'", and the tool
-    # answers isError for every word rather than returning a paradigm.
-    # Only the fields this tool sets on every path stay non-nullable.
-    input: str
+    # lemma and partofspeech are None when Vabamorf cannot analyse the
+    # word. Every other optional field is absent when it does not apply.
     lemma: str | None
     partofspeech: str | None
-    partofspeech_estonian: str | None
-    word_class: str | None
-    word_class_estonian: str | None
+    partofspeech_estonian: str
+    word_class: str
+    word_class_estonian: str
     forms: list[dict]
     paradigm_count: int
-    paradigm_key: str | None
-    other_paradigms: list[dict] | None
-    ranked_by_corpus_frequency: bool | None
-    ambiguity_estonian: str | None
-    reading_estonian: str | None
-    invariant: bool | None
-    invariant_estonian: str | None
+    paradigm_key: str
+    other_paradigms: list[dict]
+    ranked_by_corpus_frequency: bool
+    ambiguity_estonian: str
+    reading_estonian: str
+    invariant: bool
+    invariant_estonian: str
     summary_estonian: str
-    note: str
 
 
 class _RelatedWordsResult(TypedDict, total=False):
-    word: str
     matches: list[dict]
 
 
 class _SynonymsResult(TypedDict, total=False):
-    word: str
     synsets: list[dict]
     synset_count: int
 
 
 class _HyphenationResult(TypedDict, total=False):
-    word: str
     breaks: list[int]
     preferred: str
     syllable_count: int
-    summary_estonian: str
-    note: str
 
 
 class _CompoundFamiliarityResult(TypedDict, total=False):
-    text: str
     compounds_analysed: int
-    suspect_compounds: list[dict]
-    unattested_compounds: list[dict]
+    suspect_compounds: list[str]
+    unattested_compounds: list[str]
     wordnet_checked: bool
     all_compounds: list[dict]
     summary_estonian: str
@@ -1214,7 +1317,6 @@ class _CompoundFamiliarityResult(TypedDict, total=False):
 
 
 class _DomainTermsResult(TypedDict, total=False):
-    text: str
     glossary_size: int
     identifiers_size: int
     suggest_cutoff: float
@@ -1227,12 +1329,10 @@ class _DomainTermsResult(TypedDict, total=False):
 
 
 class _StyleResult(TypedDict, total=False):
-    text: str
     repetition: dict
     passive_voice: dict
     sentence_length: dict
     hedging: dict
-    note: str
 
 
 class _RegisterResult(TypedDict, total=False):
@@ -1244,46 +1344,37 @@ class _RegisterResult(TypedDict, total=False):
     consistency: dict
     structure: dict
     word_count: int
-    note: str
 
 
 class _CheckResult(TypedDict, total=False):
     """Shared output shape for the issue-list orthography/grammar checks."""
-    text: str
     issues: list[dict]
     summary_estonian: str
-    note: str
 
 
 class _LegaleseResult(TypedDict, total=False):
     """Output of check_legalese: simplification hints + terms to preserve."""
-    text: str
     issues: list[dict]
     terms_of_art: list[dict]
     summary_estonian: str
-    note: str
 
 
 class _DefinedTermsResult(TypedDict, total=False):
     """Output of check_defined_terms: defined-term map + cross-references."""
-    text: str
     defined_terms: list[dict]
     cross_references: list[dict]
     issues: list[dict]
     summary_estonian: str
-    note: str
 
 
 class _LegalUsageResult(TypedDict, total=False):
     """Output of common_legal_usage: canonical collocations for a legal term."""
-    word: str
     lemma: str
     found: bool
     frequency: int
     common_before: list[dict]
     common_after: list[dict]
     summary_estonian: str
-    note: str
 
 
 # ---------------------------------------------------------------------------
@@ -1297,11 +1388,9 @@ class _LegalUsageResult(TypedDict, total=False):
     openWorldHint=False,
 ))
 @_counted
-def tokenize(text: Annotated[str, Field(description="Estonian text to split into sentences and words.")]) -> _TokenizeResult:
-    """Split Estonian text into sentences and words.
-
-    Returns a dict with `sentences` (list of strings) and `words` (list of strings).
-    Input is capped at 100,000 characters.
+def tokenize(text: Annotated[str, Field(description="Estonian text.")]) -> _TokenizeResult:
+    """Split Estonian text into `sentences` and `words` (every token in
+    order, punctuation included).
     """
     _check_text(text)
     Text = _Text()
@@ -1315,7 +1404,7 @@ def tokenize(text: Annotated[str, Field(description="Estonian text to split into
 def _usage_note(lemma: str | None, pos: str | None) -> tuple[str | None, str | None]:
     """Return (code, estonian_note) for a word, or (None, None) if neutral.
 
-    Priority: POS-tag markers (X, Y, I, H) before lemma-lexicon markers.
+    Priority: POS-tag markers (Y, I, H) before lemma-lexicon markers.
     Word is matched lowercased against the lemma lexicon.
     """
     if pos and pos in _POS_USAGE_NOTES_ET:
@@ -1471,34 +1560,19 @@ def _is_indeclinable_attr(
     openWorldHint=False,
 ))
 @_counted
-def analyze_morphology(text: Annotated[str, Field(description="Estonian text to analyse morphologically.")], all_analyses: Annotated[bool, Field(description="Return every ambiguous analysis per word instead of only the most likely one.")] = False) -> list[dict]:
-    """Run full morphological analysis on Estonian text.
+def analyze_morphology(text: Annotated[str, Field(description="Estonian text.")], all_analyses: Annotated[bool, Field(description="Return every reading left after in-context disambiguation, in an `analyses` list, instead of only the most likely one.")] = False) -> list[dict]:
+    """Morphological analysis of each word (punctuation omitted): `word`,
+    `lemma`, `partofspeech` (pos_tag's tags), `form` (Vabamorf code, ""
+    if uninflected), `root` (`_` joins compound parts), `ending` ("0" =
+    none).
 
-    For each word returns lemma(s), part-of-speech, grammatical form, root,
-    ending, clitic, compound parts, ambiguity info, and a usage note
-    flagging archaic / foreign / abbreviation / interjection / proper-noun
-    cases. By default returns the first (most likely) analysis per word;
-    set `all_analyses=True` to return every ambiguous analysis.
-
-    Each word's response includes:
-      - lemma, partofspeech, form, root, ending, clitic, root_tokens
-      - analyses_count: how many alternative analyses Vabamorf produced
-        for this surface form (>1 means the word is morphologically
-        ambiguous)
-      - is_ambiguous: shorthand for analyses_count > 1
-      - usage_note: machine code (None if neutral)
-        ("archaic" / "foreign" / "abbreviation" / "interjection" /
-          "proper-noun")
-      - usage_note_estonian: human-readable Estonian rendering of the
-        same flag (quote this verbatim in Estonian replies; do NOT
-        translate the English usage_note yourself)
-      - indeclinable: True for words that stay in base form when used
-        attributively (lexical indeclinables like `täis`, -tud/-nud past
-        participles like `tuntud`, and the -mata form like `täitmata`),
-        i.e. they do NOT take the noun's case ending in agreement. Use this before inflecting a
-        noun phrase so you don't wrongly decline an invariant adjective.
-
-    Input is capped at 100,000 characters.
+    Present only when they apply: `form_estonian` (the form's Estonian
+    name), `clitic`, `root_tokens` (compound parts), `analyses_count` (>1:
+    still ambiguous in context), `usage_note` (archaic, foreign,
+    abbreviation, interjection, proper-noun) and the more precise
+    `usage_note_estonian` (often names the neutral word), `indeclinable:
+    true` (keeps its base form before a noun: täis, tuntud, täitmata;
+    check it before declining a noun phrase).
     """
     _check_text(text)
     Text = _Text()
@@ -1506,6 +1580,8 @@ def analyze_morphology(text: Annotated[str, Field(description="Estonian text to 
     t.tag_layer(["morph_analysis"])
     out: list[dict] = []
     for span in t.morph_analysis:
+        if _is_punct(span):
+            continue
         word = span.text
         lemmas = list(span.lemma)
         pos = list(span.partofspeech)
@@ -1513,55 +1589,52 @@ def analyze_morphology(text: Annotated[str, Field(description="Estonian text to 
         roots = list(span.root)
         endings = list(span.ending)
         clitics = list(span.clitic)
-        root_tokens = [list(rt) for rt in span.root_tokens]
-        analyses_count = len(lemmas)
-        is_ambiguous = analyses_count > 1
-        code, et = _usage_note(_first(lemmas), _first(pos))
-        indeclinable = _is_indeclinable_attr(
-            word,
-            tuple((p or "", f or "", (lm or "").lower())
-                  for p, f, lm in zip(pos, forms, lemmas, strict=False)))
+        root_tokens = list(span.root_tokens)
+        readings = [
+            _morph_reading(lemmas[i], pos[i], forms[i], roots[i], endings[i], clitics[i],
+                           root_tokens[i] if i < len(root_tokens) else None)
+            for i in range(len(lemmas))
+        ]
         if all_analyses:
-            analyses = [
-                {
-                    "lemma": lemmas[i],
-                    "partofspeech": pos[i],
-                    "form": forms[i],
-                    "form_estonian": _form_et(forms[i], lemmas[i]),
-                    "root": roots[i],
-                    "ending": endings[i],
-                    "clitic": clitics[i],
-                    "root_tokens": root_tokens[i] if i < len(root_tokens) else [],
-                }
-                for i in range(len(lemmas))
-            ]
-            out.append({
-                "word": word,
-                "analyses": analyses,
-                "analyses_count": analyses_count,
-                "is_ambiguous": is_ambiguous,
-                "usage_note": code,
-                "usage_note_estonian": et,
-                "indeclinable": indeclinable,
-            })
+            # No analyses_count here: it would only repeat len(analyses).
+            entry: dict = {"word": word, "analyses": readings}
         else:
-            out.append({
-                "word": word,
-                "lemma": _first(lemmas),
-                "partofspeech": _first(pos),
-                "form": _first(forms),
-                "form_estonian": _form_et(_first(forms), _first(lemmas)),
-                "root": _first(roots),
-                "ending": _first(endings),
-                "clitic": _first(clitics),
-                "root_tokens": _first(root_tokens) or [],
-                "analyses_count": analyses_count,
-                "is_ambiguous": is_ambiguous,
-                "usage_note": code,
-                "usage_note_estonian": et,
-                "indeclinable": indeclinable,
-            })
+            first = readings[0] if readings else _morph_reading(
+                None, None, None, None, None, None, None)
+            entry = {"word": word, **first}
+            if len(readings) > 1:
+                entry["analyses_count"] = len(readings)
+        code, et = _usage_note(_first(lemmas), _first(pos))
+        if code:
+            entry["usage_note"] = code
+            entry["usage_note_estonian"] = et
+        if _is_indeclinable_attr(
+                word,
+                tuple((p or "", f or "", (lm or "").lower())
+                      for p, f, lm in zip(pos, forms, lemmas, strict=False))):
+            entry["indeclinable"] = True
+        out.append(entry)
     return out
+
+
+def _morph_reading(lemma: str | None, pos: str | None, form: str | None,
+                   root: str | None, ending: str | None, clitic: str | None,
+                   parts: Any) -> dict:
+    """One Vabamorf reading as analyze_morphology reports it, in either
+    mode. A key that would say nothing is left out: `form_estonian` when
+    the form has no Estonian name, an empty `clitic`, and a one-part
+    `root_tokens`, which is only `root` without its markers."""
+    reading: dict = {"lemma": lemma, "partofspeech": pos, "form": form}
+    label = _form_et(form, lemma)
+    if label:
+        reading["form_estonian"] = label
+    reading["root"] = root
+    reading["ending"] = ending
+    if clitic:
+        reading["clitic"] = clitic
+    if parts and len(parts) > 1:
+        reading["root_tokens"] = list(parts)
+    return reading
 
 
 def _form_et(code: str, lemma: str | None = None) -> str | None:
@@ -1862,13 +1935,11 @@ def _paradigm(word: str) -> dict:
     analyses = vm.analyze([word], disambiguate=True)
     if not analyses or not analyses[0].get("analysis"):
         return {
-            "input": word,
             "lemma": None,
             "partofspeech": None,
             "forms": [],
             "paradigm_count": 0,
             "summary_estonian": f"Sõnale '{word}' paradigmat ei leitud.",
-            "note": "Vabamorf couldn't analyse this word.",
         }
     primary = analyses[0]["analysis"][0]
     lemma = primary["lemma"]
@@ -1905,7 +1976,6 @@ def _paradigm(word: str) -> dict:
         class_name = "verb"
     else:
         return {
-            "input": word,
             "lemma": lemma,
             "partofspeech": pos,
             "partofspeech_estonian": _POS_LABELS_ET.get(pos, pos),
@@ -1913,10 +1983,6 @@ def _paradigm(word: str) -> dict:
             "paradigm_count": 0,
             "summary_estonian": (
                 f"Sõnaliik {_pos_et(pos)} ei käändu ega pöördu, paradigmat pole."
-            ),
-            "note": (
-                "This part of speech does not inflect (e.g. adverbs, "
-                "conjunctions, particles). No paradigm to generate."
             ),
         }
 
@@ -1961,10 +2027,17 @@ def _paradigm(word: str) -> dict:
                 chosen_by_input = True
 
     key, forms = tables[0]
-    others = [{"paradigm_key": k, "forms": f} for k, f in tables[1:]]
+    # Every table is built from the same `labels`, so a code the first
+    # table already names gets no second `form_estonian` further down.
+    labelled = {e["form"] for e in forms}
+    others = [
+        {"paradigm_key": k,
+         "forms": [{"form": e["form"], "surface": e["surface"]}
+                   if e["form"] in labelled else e for e in f]}
+        for k, f in tables[1:]
+    ]
 
     result = {
-        "input": word,
         "lemma": lemma,
         "partofspeech": pos,
         "partofspeech_estonian": _POS_LABELS_ET.get(pos, pos),
@@ -1972,29 +2045,13 @@ def _paradigm(word: str) -> dict:
         "word_class_estonian": _WORD_CLASS_ET[class_name],
         "forms": forms,
         "paradigm_count": len(tables),
-        "summary_estonian": (
-            f"Sõna '{lemma}' ({_pos_et(pos)}) paradigma: {len(forms)} vormi."
-        ),
-        "note": (
-            "Generated via Vabamorf.synthesize. Some forms may be marked, "
-            "rare, or stylistically odd: Vabamorf produces what's "
-            "morphologically possible, not what a native speaker would "
-            "necessarily use. Passing an INFLECTED form (e.g. 'koti') is "
-            "better than the bare lemma when a word has several paradigms: "
-            "it tells the server which one you mean. Where a word has both "
-            "'ainsuse sisseütlev' (majasse) and 'ainsuse lühike sisseütlev' "
-            "(majja), both are correct illatives and the short one is often "
-            "the commoner, so neither should be 'corrected' into the other. "
-            "Note that for most words with a short illative the surface is "
-            "identical to the singular partitive (vend: venda is both), so "
-            "finding a word in this table does NOT confirm the case is "
-            "right for the sentence it appears in. Where a slot lists "
-            "several surfaces, the first is the one built on this "
-            "paradigm's own genitive stem (pl all: raamatutele before "
-            "raamatuile); the others are real forms of the same slot, "
-            "typically the literary i-plural."
-        ),
     }
+    if not forms:
+        # `ei` reaches this path as a verb with no forms; a table that is
+        # not empty explains itself.
+        result["summary_estonian"] = (
+            f"Sõna '{lemma}' ({_pos_et(pos)}) paradigma: 0 vormi."
+        )
     if key:
         result["paradigm_key"] = key
     if reading_et:
@@ -2038,41 +2095,32 @@ def _paradigm(word: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def paradigm(word: Annotated[str, Field(description="A single Estonian word (lemma or inflected form) to generate the full paradigm for.")]) -> _ParadigmResult:
-    """Generate the full inflection paradigm for an Estonian word.
+def paradigm(word: Annotated[str, Field(description="One Estonian word, lemma or inflected form.")]) -> _ParadigmResult:
+    """Inflection paradigm of one Estonian word from Vabamorf, which
+    generates what is possible, not necessarily idiomatic.
 
-    For nominals (nouns, adjectives, pronouns, cardinals, ordinals,
-    comparatives, superlatives): produces all 14 cases × 2 numbers = up to
-    28 forms, plus the SHORT ILLATIVE (`adt`, ainsuse lühike sisseütlev)
-    for the words that have one: `majja` beside `majasse`, `kätte` beside
-    `käesse`. Both are correct illatives and the short one is often the
-    commoner, so neither should be "corrected" into the other. For most
-    words that have one, though, the short illative is spelled exactly
-    like the singular partitive (`vend`: `venda` is both), so a surface
-    appearing in this table does not confirm the case is right where it
-    was used. For verbs: produces infinitives, the indicative present
-    and past, the conditional, the imperative, the participles, and the
-    umbisikuline tegumood's own finite forms (`kasutatakse`, `kasutati`,
-    `kasutataks`), about 39 in all. Other parts of speech (adverbs,
-    conjunctions, particles) don't inflect, so `forms` is empty.
+    Nominals: up to 28 forms, 14 cases in singular and plural (iga has no
+    plural), plus the short illative `adt` (majja beside majasse) where it
+    exists. Verbs: about 39 common forms, impersonal included, not all
+    Vabamorf can make. A word that does not inflect gets empty `forms` and
+    a `summary_estonian` saying why.
 
-    Each form entry has the Vabamorf form code (e.g. `sg p`, `ksin`),
-    its Estonian label (e.g. `ainsuse osastav`, `tingiv 1.p ainsus`),
-    and the surface form Vabamorf generated. Use `form_estonian` verbatim
-    in Estonian replies. Don't translate the English `form` code.
+    `forms` entries: `form` (Vabamorf code), `form_estonian` (its Estonian
+    name), `surface`. A list `surface` holds correct variants, any built on
+    this paradigm's own stem first (raamatutele before the literary
+    raamatuile).
 
-    AMBIGUOUS LEMMAS. Some lemmas belong to more than one inflection type
-    (`kott` inflects as either `koti` or `kota`, two different words that
-    share a nominative). `forms` is then one internally consistent
-    paradigm, `paradigm_key` names it by its singular genitive,
-    `paradigm_count` says how many exist, and the rest are in
-    `other_paradigms`. Read `ambiguity_estonian` before quoting a form.
-    **Pass an inflected form (`koti`) rather than the bare lemma when you
-    know which word you mean**: that selects the paradigm exactly.
+    Both illatives are correct and the short illative is often the
+    commoner: never "correct" one into the other. `adt` is usually spelled
+    like the singular partitive `sg p` (vend: venda), so a surface in this
+    table does not confirm its case in a sentence.
 
-    Phase-1 scope: covers the most commonly-needed forms per word class,
-    not every theoretical form Vabamorf can produce. Single-word input,
-    capped at 200 characters.
+    `paradigm_count` > 1 means several inflection types (kott: koti or
+    kota): `forms` is the first-ranked, named by `paradigm_key` (its
+    singular genitive), and the rest are in `other_paradigms`, which give
+    `form_estonian` only for a code `forms` lacks. Read
+    `ambiguity_estonian` before quoting a form. Pass an inflected form
+    (koti) to select the type you mean.
     """
     return _paradigm(word)
 
@@ -2084,11 +2132,9 @@ def paradigm(word: Annotated[str, Field(description="A single Estonian word (lem
     openWorldHint=False,
 ))
 @_counted
-def lemmatize(text: Annotated[str, Field(description="Estonian text to reduce to dictionary-form lemmas.")]) -> list[dict]:
-    """Return lemma (dictionary form) for each word in the text.
-
-    Concise output: `[{"word": ..., "lemma": ...}, ...]`. Input is capped at
-    100,000 characters.
+def lemmatize(text: Annotated[str, Field(description="Estonian text.")]) -> list[dict]:
+    """Lemma (dictionary form) of each word, from its most likely
+    analysis. Punctuation is omitted.
     """
     _check_text(text)
     Text = _Text()
@@ -2097,6 +2143,7 @@ def lemmatize(text: Annotated[str, Field(description="Estonian text to reduce to
     return [
         {"word": span.text, "lemma": _first(list(span.lemma))}
         for span in t.morph_analysis
+        if not _is_punct(span)
     ]
 
 
@@ -2107,12 +2154,15 @@ def lemmatize(text: Annotated[str, Field(description="Estonian text to reduce to
     openWorldHint=False,
 ))
 @_counted
-def pos_tag(text: Annotated[str, Field(description="Estonian text to part-of-speech tag.")]) -> list[dict]:
-    """Return part-of-speech tag for each word.
+def pos_tag(text: Annotated[str, Field(description="Estonian text.")]) -> list[dict]:
+    """Part-of-speech tag of each word (most likely reading); punctuation
+    omitted.
 
-    POS tag set: S=noun, V=verb, A=adj, P=pron, D=adv, K=adp, J=conj,
-    N=numeral, I=interj, Y=abbrev, X=foreign, Z=punct, etc. Input is capped
-    at 100,000 characters.
+    S noun, H proper noun, V verb, A adjective (C comparative, U
+    superlative, G indeclinable), P pronoun, D adverb, K adposition, J
+    conjunction, N cardinal, O ordinal, I interjection, Y abbreviation or
+    symbol (§, €), X verb-bound word (`plehku`), Z a word of 40+
+    characters, too long for Vabamorf to analyse.
     """
     _check_text(text)
     Text = _Text()
@@ -2121,6 +2171,7 @@ def pos_tag(text: Annotated[str, Field(description="Estonian text to part-of-spe
     return [
         {"word": span.text, "partofspeech": _first(list(span.partofspeech))}
         for span in t.morph_analysis
+        if not _is_punct(span)
     ]
 
 
@@ -2131,19 +2182,15 @@ def pos_tag(text: Annotated[str, Field(description="Estonian text to part-of-spe
     openWorldHint=False,
 ))
 @_counted
-def spell_check(text: Annotated[str, Field(description="Estonian text to spell-check.")], suggestions: Annotated[bool, Field(description="Include correction suggestions for misspelled words.")] = True) -> list[dict]:
-    """Check Estonian spelling for each word and optionally return suggestions.
+def spell_check(text: Annotated[str, Field(description="Estonian text.")], suggestions: Annotated[bool, Field(description="Include correction suggestions for misspelled words.")] = True) -> list[dict]:
+    """Spell-check Estonian text. Lists only the misspelled tokens, each
+    occurrence in text order: `text`, `spelling: false`, and
+    `suggestions` when Vabamorf has any. An empty list means every word
+    passed.
 
-    Returns one entry per word with `text`, `spelling` (bool), and
-    `suggestions` (list of correction candidates) when `suggestions=True`.
-    Input is capped at 100,000 characters.
-
-    CAVEAT: Vabamorf accepts ANY morphologically well-formed word,
-    including compounds you just invented (e.g. `toortõlkeoht`). It
-    splits them into valid roots and reports `spelling: true`. So passing
-    spell_check does NOT mean a word is real, attested Estonian. For a
-    compound you coined yourself, ask `check_compound_familiarity` whether
-    the lemma is attested in the corpus vocabulary or Estonian WordNet.
+    Passing proves only that a word is well-formed: Vabamorf accepts any
+    valid compound, even an invented one (`toortõlkeoht`). Check a
+    compound you coined with check_compound_familiarity.
     """
     _check_text(text)
     Text = _Text()
@@ -2152,7 +2199,14 @@ def spell_check(text: Annotated[str, Field(description="Estonian text to spell-c
     words = [w.text for w in t.words]
     if not words:
         return []
-    return _vabamorf().spellcheck(words, suggestions=suggestions)
+    out: list[dict] = []
+    for row in _vabamorf().spellcheck(words, suggestions=suggestions):
+        if row["spelling"]:
+            continue
+        if not row.get("suggestions"):
+            row.pop("suggestions", None)
+        out.append(row)
+    return out
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -2162,11 +2216,10 @@ def spell_check(text: Annotated[str, Field(description="Estonian text to spell-c
     openWorldHint=False,
 ))
 @_counted
-def syllabify(word: Annotated[str, Field(description="A single Estonian word (no whitespace) to split into syllables.")]) -> list[dict]:
-    """Split a single Estonian word into syllables with quantity and accent.
-
-    Each syllable entry: `{"syllable": str, "quantity": int, "accent": int}`.
-    Input is capped at 200 characters and must contain no whitespace.
+def syllabify(word: Annotated[str, Field(description="One Estonian word, no whitespace.")]) -> list[dict]:
+    """Lowercased syllables of one Estonian word; `quantity` is the välde
+    (1-3), `accent` 1 marks stress. Vabamorf's guesser syllabifier: it can
+    err even on common words.
     """
     _check_text(word, limit=MAX_WORD_CHARS, name="word")
     if any(ch.isspace() for ch in word):
@@ -2182,11 +2235,10 @@ def syllabify(word: Annotated[str, Field(description="A single Estonian word (no
     openWorldHint=False,
 ))
 @_counted
-def named_entities(text: Annotated[str, Field(description="Estonian text to extract named entities (people, places, organisations) from.")]) -> list[dict]:
-    """Extract named entities (PER/LOC/ORG) using EstNLTK's CRF model.
-
-    Returns `[{"text": ..., "type": ..., "start": ..., "end": ...}, ...]`.
-    Input is capped at 100,000 characters.
+def named_entities(text: Annotated[str, Field(description="Estonian text.")]) -> list[dict]:
+    """People, places and organisations (`type` PER, LOC, ORG) with
+    character offsets `start` and `end`. `text` is the span as written,
+    often inflected (`Tallinnas`).
     """
     _check_text(text)
     Text = _Text()
@@ -2210,33 +2262,14 @@ def named_entities(text: Annotated[str, Field(description="Estonian text to extr
     openWorldHint=False,
 ))
 @_counted
-def find_related_words(word: Annotated[str, Field(description="A single Estonian word to find semantically related words for.")], n: Annotated[int, Field(description="How many nearest-neighbour words to return (1-50).")] = 10) -> _RelatedWordsResult:
-    """Find Estonian words semantically similar to the input via fastText.
-
-    Returns the top-n nearest neighbours by cosine similarity over a
-    pre-trained Estonian fastText model (Common Crawl + Wikipedia, 2018).
-    Useful for breaking repetition, finding alternative phrasings, or
-    expanding vocabulary when WordNet's exact-meaning synonyms aren't
-    enough.
-
-    Distinct from `synonyms`: that one returns WordNet synsets, words
-    with the same meaning. This one returns words that *pattern* with
-    the input in real Estonian text, which can include near-synonyms,
-    related concepts, and (sometimes) antonyms.
-
-    Known quirks of the embedding model:
-    - **Inflections crowd the top results** for some words. fastText
-      sees `kasutama` and `kasutada` as related because the surface
-      forms share subword n-grams; you may want to lemmatize matches
-      yourself to dedupe.
-    - **Antonyms can appear** because antonyms occur in similar
-      contexts (`tark` may surface `loll`). Treat the list as
-      "semantically nearby" rather than "synonymous."
-    - **Polysemy is not disambiguated.** `lahe` (which means both
-      "bay" and the colloquial "cool") will return whichever sense
-      dominates the training data.
-
-    Single-word input only, capped at 200 characters.
+def find_related_words(word: Annotated[str, Field(description="One Estonian word, any form.")], n: Annotated[int, Field(description="How many nearest-neighbour words to return (1-50).")] = 10) -> _RelatedWordsResult:
+    """Nearest neighbours of an Estonian word in a fastText model (Common
+    Crawl and Wikipedia), ranked by cosine `score`. Unlike `synonyms` (same
+    meaning, WordNet), these are words used in similar contexts:
+    near-synonyms, related concepts, inflections of the input itself
+    (lemmatize to dedupe) and sometimes antonyms (tark: loll). Senses are
+    not separated: `lahe` gets whichever of "bay" and "cool" dominates the
+    corpus. Any string, even a typo, gets neighbours.
     """
     _check_text(word, limit=MAX_WORD_CHARS, name="word")
     if any(ch.isspace() for ch in word):
@@ -2245,7 +2278,6 @@ def find_related_words(word: Annotated[str, Field(description="A single Estonian
     kv = _embeddings()
     matches = kv.most_similar(word, topn=n)
     return {
-        "word": word,
         "matches": [
             {"word": w, "score": round(float(s), 4)} for w, s in matches
         ],
@@ -2259,27 +2291,17 @@ def find_related_words(word: Annotated[str, Field(description="A single Estonian
     openWorldHint=False,
 ))
 @_counted
-def synonyms(word: Annotated[str, Field(description="A single Estonian word to look up WordNet synonyms for.")], max_synsets: Annotated[int, Field(description="Maximum number of word-sense synsets to return.")] = 5) -> _SynonymsResult:
-    """Look up Estonian synonyms via WordNet.
+def synonyms(word: Annotated[str, Field(description="One Estonian word in dictionary form, spelled as the dictionary spells it (kohv, not kohvi or Kohv).")], max_synsets: Annotated[int, Field(description="Maximum number of word-sense synsets to return.")] = 5) -> _SynonymsResult:
+    """Estonian WordNet synsets for a word, one per sense, each with
+    `lemmas` (the synonyms), any `definition` and any `examples`.
+    `synset_count` is the total before `max_synsets` cuts the list.
 
-    Returns synsets (groups of synonymous lemmas) for the input word, each
-    with its definition and example usages. Useful when you want Claude to
-    pick a different word with the same meaning, e.g. swap an over-used
-    verb in marketing copy. Word-sense ambiguity is preserved: a polysemous
-    word returns multiple synsets, one per meaning. Input capped at 200
-    characters.
-
-    WORD-FIT CHECK: when the question is "is this the right word here?"
-    rather than "give me an alternative", READ EACH `definition` and test
-    it against the user's actual context. Do not just harvest `lemmas`.
-    Estonian glosses routinely carry a domain constraint that decides the
-    answer: `korpus` returns the sense "kirjaliku või suulise teksti
-    elektrooniline kogu", so calling a set of IMAGES a `korpus` is wrong
-    however natural it sounds in ML jargon; `andmestik` carries no such
-    constraint. A gloss naming a medium, field, or material is a
-    constraint on where the word may be used. Note also that a word can
-    be well-formed, correctly spelled and still the wrong register. For
-    that, check_officialese and classify_register, not this tool.
+    For "is this the right word here?", read each `definition` against the
+    context, not just `lemmas`. A gloss naming a medium, field or material
+    limits where the word fits: `korpus` is "kirjaliku või suulise teksti
+    elektrooniline kogu", so a set of images is not a korpus, while
+    `andmestik` has no such limit. Register is a different question:
+    check_officialese, classify_register.
     """
     _check_text(word, limit=MAX_WORD_CHARS, name="word")
     if any(ch.isspace() for ch in word):
@@ -2298,14 +2320,15 @@ def synonyms(word: Annotated[str, Field(description="A single Estonian word to l
     synsets = wn[word] or []
     out: list[dict] = []
     for s in synsets[:max_synsets]:
-        out.append({
-            "name": s.name,
-            "pos": s.pos,
-            "definition": s.definition,
-            "examples": list(s.examples) if s.examples else [],
-            "lemmas": list(s.lemmas),
-        })
-    return {"word": word, "synsets": out, "synset_count": len(synsets)}
+        # The POS is in `name` (korpus.n.01), so it is not repeated.
+        entry: dict = {"name": s.name}
+        if s.definition:
+            entry["definition"] = s.definition
+        if s.examples:
+            entry["examples"] = list(s.examples)
+        entry["lemmas"] = list(s.lemmas)
+        out.append(entry)
+    return {"synsets": out, "synset_count": len(synsets)}
 
 
 def _classify_register(text: str) -> dict:
@@ -2351,11 +2374,11 @@ def _classify_register(text: str) -> dict:
         raw = len(formal_hits) - len(colloquial_hits)
         score = max(-1.0, min(1.0, raw * 4.0 / word_count))
 
-    # Structural signals. The tool's own note always conceded that real
-    # register lives in syntax as much as vocabulary, and a dense R&D
-    # report scored 'neutraalne', 0.0, with zero markers, while 87.5% of
-    # its verbs were umbisikuline tegumood. Impersonal voice and noun
-    # density now contribute, bounded and additive-only:
+    # Structural signals. Real register lives in syntax as much as
+    # vocabulary: on the lexicon alone a dense R&D report scored
+    # 'neutraalne', 0.0, with zero markers, while 87.5% of its verbs were
+    # umbisikuline tegumood. Impersonal voice and noun density now
+    # contribute, bounded and additive-only:
     #   * they apply only from 25 words up, so short strings still score
     #     purely on the lexicon;
     #   * they apply only when the lexicon is not net-colloquial, so
@@ -2445,25 +2468,6 @@ def _classify_register(text: str) -> dict:
             ),
         },
         "word_count": word_count,
-        "note": (
-            "Heuristic classifier: lexicon-based and lemma-aware, plus "
-            "two structural signals. The lexicon covers legal-"
-            "administrative AND academic/report vocabulary. `structure` "
-            "adds umbisikuline tegumood ratio and noun/verb density, "
-            "bounded at +0.4 and applied only from 25 words up and only "
-            "when the lexicon is not net-colloquial. Without them a dense "
-            "R&D report scored 'neutraalne' at 0.0 while 87.5% of its "
-            "verbs were impersonal. The `consistency` field flags texts "
-            "that carry BOTH formal AND colloquial markers, useful for "
-            "catching jarring register-mixing even when the overall "
-            "tier rounds to 'neutral'. Treat as a directional hint, not "
-            "a verdict; for a full kantseliit breakdown use "
-            "check_officialese. When composing an Estonian-language reply, "
-            "USE THE tier_estonian AND consistency.summary_estonian "
-            "FIELDS VERBATIM rather than translating yourself: common "
-            "mistranslations include 'formalne' (wrong) vs 'formaalne' "
-            "(correct)."
-        ),
     }
 
 
@@ -2499,32 +2503,16 @@ def _check_capitalization(text: str) -> dict:
 
         rule: str | None = None
         rule_estonian: str | None = None
-        explanation: str | None = None
 
         if lemma_lower in _WEEKDAYS_ET:
             rule = "weekday"
             rule_estonian = "nädalapäev"
-            explanation = (
-                "Estonian weekday names are written with a lowercase initial "
-                "letter mid-sentence (Algustäheortograafia, EKI Reeglid). "
-                "Capitalize only at the start of a sentence."
-            )
         elif lemma_lower in _MONTHS_ET:
             rule = "month"
             rule_estonian = "kuu nimi"
-            explanation = (
-                "Estonian month names are written with a lowercase initial "
-                "letter mid-sentence (Algustäheortograafia, EKI Reeglid). "
-                "Capitalize only at the start of a sentence."
-            )
         elif lemma_lower in _NATIONALITIES_ET:
             rule = "nationality"
             rule_estonian = "rahvuse nimetus"
-            explanation = (
-                "Estonian nationality names (eestlane, soomlane, sakslane, …) "
-                "are lowercase mid-sentence (Algustäheortograafia, EKI Reeglid). "
-                "Capitalize only at the start of a sentence."
-            )
         elif word.lower() in _LANG_ADJECTIVES_ET:
             # Country/language adjectives are lowercase only when used
             # attributively before a culture/language noun. The
@@ -2543,12 +2531,6 @@ def _check_capitalization(text: str) -> dict:
             if next_lemma in _CULTURE_NOUNS_ET:
                 rule = "language-adjective"
                 rule_estonian = "keele- või kultuuriadjektiiv"
-                explanation = (
-                    "Language and culture adjectives derived from country "
-                    "names are lowercase when attributive (eesti keel, vene "
-                    "kultuur, soome saun). Capitalize only as a country "
-                    "proper noun on its own (Eesti, Eesti Vabariik, Eestis)."
-                )
 
         if rule is None:
             continue
@@ -2558,26 +2540,14 @@ def _check_capitalization(text: str) -> dict:
             "position": span.start,
             "rule": rule,
             "rule_estonian": rule_estonian,
-            "explanation": explanation,
             "suggestion": word[0].lower() + word[1:],
         })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} algustäheortograafia viga." if issues
             else "Algustäheortograafia probleeme ei leitud."
-        ),
-        "note": (
-            "Heuristic Algustäheortograafia checker: covers the four most "
-            "common AI-generated mistakes (weekdays, months, nationalities, "
-            "and language/culture adjectives before related nouns). Not a "
-            "full EÕS substitute; edge cases like proper-noun brand names "
-            "containing a culture word (e.g. a restaurant called 'Eesti Köök') "
-            "may produce a false positive that the user can ignore. When "
-            "surfacing rule labels in an Estonian reply, USE THE rule_estonian "
-            "FIELD VERBATIM rather than translating `rule` yourself."
         ),
     }
 
@@ -2606,30 +2576,14 @@ def _check_compounds(text: str) -> dict:
                 "position": a.start,
                 "rule": "compound-split",
                 "rule_estonian": "liitsõna kokkukirjutamine",
-                "explanation": (
-                    f"In Estonian, '{joined}' is a single compound word "
-                    f"and should be written together (liitsõnaõigekiri, EKI "
-                    f"Reeglid). The split form is a common AI mistake."
-                ),
                 "suggestion": joined,
             })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} liitsõnaõigekirja viga." if issues
             else "Liitsõnaõigekirja probleeme ei leitud."
-        ),
-        "note": (
-            "Heuristic liitsõnaõigekiri checker: flags ~30 common "
-            "AI-generated compound-splits per a hand-curated bigram "
-            "lexicon. NOT exhaustive: Estonian compounding is productive "
-            "and many valid compounds aren't in the lexicon. Treat hits "
-            "as high-confidence (likely real errors); absence of hits is "
-            "NOT proof of compound correctness. When surfacing rule "
-            "labels in an Estonian reply, USE THE rule_estonian FIELD "
-            "VERBATIM rather than translating `rule` yourself."
         ),
     }
 
@@ -2641,20 +2595,12 @@ def _check_compounds(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_compounds(text: Annotated[str, Field(description="Estonian text to check for wrongly split compound words.")]) -> _CheckResult:
-    """Heuristic Estonian compound-word check (liitsõnaõigekiri).
+def check_compounds(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags compounds wrongly written as two words (liitsõnaõigekiri):
+    `kooli maja` → `koolimaja`.
 
-    Scans for common AI-generated splits of words that should be written
-    as a single compound: `kooli maja` (wrong) → `koolimaja` (right),
-    `nädala vahetus` (wrong) → `nädalavahetus` (right), etc. Uses a
-    curated bigram lexicon (~30 entries covering the highest-frequency
-    AI mistakes); not a full liitsõnaõigekiri solver.
-
-    Phase-1 limitations: only catches the bigrams in the lexicon.
-    Estonian compounding is highly productive and most valid compounds
-    aren't enumerated here. Treat hits as high-confidence; absence of
-    hits does not prove the compound writing is correct everywhere.
-    Input capped at 100,000 characters.
+    Matches a curated list of about 30 common splits, so a hit is reliable
+    but most compounds are not covered.
     """
     return _check_compounds(text)
 
@@ -2683,32 +2629,14 @@ def _check_punctuation(text: str) -> dict:
             "position": span.start,
             "rule": "comma-before-clause-conjunction",
             "rule_estonian": "koma alistava sidesõna ees",
-            "explanation": (
-                f"Estonian punctuation rules require a comma before "
-                f"clause-introducing conjunctions like '{span.text}'. "
-                f"Insert a comma between the previous word and "
-                f"'{span.text}'."
-            ),
             "suggestion": f", {span.text}",
         })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} kirjavahemärgiviga." if issues
             else "Kirjavahemärgivigu ei leitud."
-        ),
-        "note": (
-            "Heuristic comma checker: catches missing commas before "
-            "the most common subordinating conjunctions (et, kuna, sest, "
-            "kuigi, kuid, vaid, nagu, mistõttu, millepärast, kuhu). "
-            "Excludes `kui` / `mis` / `kes` because their function is "
-            "context-dependent (kui = than/when, mis = which/what) and "
-            "naive flagging produces too many false positives. NOT a full "
-            "Estonian punctuation rule engine: listing comma, "
-            "apposition comma, and dash/colon rules are out of scope for "
-            "phase 1. Quote `rule_estonian` verbatim in Estonian replies."
         ),
     }
 
@@ -2720,20 +2648,14 @@ def _check_punctuation(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_punctuation(text: Annotated[str, Field(description="Estonian text to check for missing commas before subordinating conjunctions.")]) -> _CheckResult:
-    """Heuristic Estonian punctuation check: comma-before-clause rule.
+def check_punctuation(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags a missing comma before et, kuna, sest, kuigi, kuid, vaid, nagu,
+    mistõttu, millepärast or kuhu.
 
-    Flags missing commas before subordinating conjunctions where Estonian
-    rules require one: et (that/in order to), kuna (because), sest
-    (because), kuigi (although), kuid (but), vaid (rather), nagu (like),
-    mistõttu (because of which), millepärast, kuhu.
-
-    Phase-1 limitations: only the comma-before-clause-conjunction rule
-    is covered. `kui`, `mis`, `kes` are deliberately excluded because
-    their function is contextual (kui = than/as in comparisons doesn't
-    need a comma). Listing commas, apposition commas, dash and colon
-    rules: all out of scope for phase 1. Input capped at 100,000
-    characters.
+    Not checked: kui, mis, kes (their comma depends on meaning), list and
+    apposition commas, dashes, colons. In nii et, ilma et and selleks et the
+    comma goes before the pair, not before et; nagu in a verbless
+    comparison (tugev nagu karu) takes none.
     """
     return _check_punctuation(text)
 
@@ -2746,17 +2668,7 @@ def _check_hyphenation(word: str) -> dict:
     from estnltk.vabamorf.morf import syllabify_word
     syls = syllabify_word(word)
     if len(syls) < 2:
-        return {
-            "word": word,
-            "breaks": [],
-            "preferred": word,
-            "syllable_count": len(syls),
-            "summary_estonian": "Sõna on liiga lühike poolitamiseks.",
-            "note": (
-                "Single-syllable Estonian words can't be hyphenated "
-                "across lines."
-            ),
-        }
+        return {"breaks": [], "preferred": word, "syllable_count": len(syls)}
     breaks: list[int] = []
     offset = 0
     for _i, s in enumerate(syls[:-1]):
@@ -2773,27 +2685,7 @@ def _check_hyphenation(word: str) -> dict:
         last = b
     pieces.append(word[last:])
     preferred = "·".join(pieces) if breaks else word
-    return {
-        "word": word,
-        "breaks": breaks,
-        "preferred": preferred,
-        "syllable_count": len(syls),
-        "summary_estonian": (
-            f"Lubatud poolitamiskohad: {breaks}." if breaks
-            else "Sõnal puuduvad turvalised poolitamiskohad."
-        ),
-        "note": (
-            "Phase-1 hyphenation: syllable-boundary based, with the "
-            "edge-character rule that you can't leave fewer than 2 "
-            "characters before or after the break. Compound-boundary "
-            "preference is NOT applied yet (Estonian poolitamine "
-            "prefers compound seams over syllable seams); for compounds "
-            "like 'koolimaja' the morphologically-preferred break is at "
-            "the compound seam, which this tool may not surface. "
-            "Treat the offsets as a safe-break list, not an authoritative "
-            "preference."
-        ),
-    }
+    return {"breaks": breaks, "preferred": preferred, "syllable_count": len(syls)}
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -2803,18 +2695,14 @@ def _check_hyphenation(word: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_hyphenation(word: Annotated[str, Field(description="A single Estonian word (no whitespace) to find safe line-break positions for.")]) -> _HyphenationResult:
-    """Return safe line-break positions for an Estonian word (poolitamine).
-
-    Different from `syllabify` (which is phonological): this returns
-    character offsets where a typesetter can legally break the word
-    across lines. Applies the no-orphan-edge rule (don't leave fewer
-    than 2 characters before or after the break point).
-
-    Phase-1 limitation: pure syllable-boundary based. Compound-boundary
-    preference (Estonian poolitamine prefers `kooli-maja` over
-    `koo-limaja`) is not yet applied. Input must be a single word with
-    no whitespace, capped at 200 characters.
+def check_hyphenation(word: Annotated[str, Field(description="One Estonian word, no whitespace.")]) -> _HyphenationResult:
+    """Line-break positions in one Estonian word (poolitamine); use only
+    when line breaks matter. `breaks`: character offsets at syllable
+    boundaries, at least 2 characters from either end; `preferred`: the
+    word with each break marked ·. Compound seams, which Estonian prefers,
+    are among the breaks but not singled out: choose the seam yourself
+    (kooli·maja). A break can also split one vowel off a compound part
+    (maao-manik in maa·o·ma·nik); skip those.
     """
     return _check_hyphenation(word)
 
@@ -2840,11 +2728,6 @@ def _check_numbers(text: str) -> dict:
             "position": m.start(),
             "rule": "decimal-separator",
             "rule_estonian": "kümnenduskoma",
-            "explanation": (
-                "Estonian uses a comma as the decimal separator, not a "
-                "period (e.g. 3,14 not 3.14). EKI Reeglid: numbrite "
-                "õigekirjutus."
-            ),
             "suggestion": corrected,
         })
 
@@ -2859,29 +2742,14 @@ def _check_numbers(text: str) -> dict:
             "position": m.start(),
             "rule": "thousands-separator",
             "rule_estonian": "tuhandeliste eraldaja",
-            "explanation": (
-                "Estonian uses a non-breaking space (or thin space) as "
-                "the thousands separator, not a comma. EKI Reeglid: "
-                "numbrite õigekirjutus."
-            ),
             "suggestion": corrected,
         })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} numbrite õigekirjutuse viga." if issues
             else "Numbrite õigekirjutuse vigu ei leitud."
-        ),
-        "note": (
-            "Heuristic number-writing checker: covers decimal-separator "
-            "(period vs comma) and thousands-separator (comma vs space) "
-            "rules. Spell-out-vs-digits guidance (Estonian convention: "
-            "spell out 1-10 in running text) is out of scope for phase 1 "
-            "because it requires context awareness (years, dates, "
-            "measurements stay as digits). Quote `rule_estonian` "
-            "verbatim in Estonian replies."
         ),
     }
 
@@ -2893,19 +2761,15 @@ def _check_numbers(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_numbers(text: Annotated[str, Field(description="Estonian text to check for number-formatting (decimal comma, thousands space).")]) -> _CheckResult:
-    """Heuristic Estonian number-writing check.
+def check_numbers(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags English-style number separators (numbrite õigekirjutus):
+    - `decimal-separator`: 3.14 → 3,14.
+    - `thousands-separator`: 1,500,000 → 1 500 000 (ideally non-breaking
+      spaces; `suggestion` has plain ones).
 
-    Flags two clear-cut cases per EKI Reeglid:
-    - Decimal separator: Estonian uses a comma (3,14), not a period (3.14).
-    - Thousands separator: Estonian uses a space (1 000 000), not a
-      comma (1,000,000).
-
-    Phase-1 limitations: spell-out-vs-digits guidance (the
-    one-to-ten-spelled-out convention) is intentionally not implemented.
-    It requires distinguishing measurements, dates, years, and lists
-    from running prose, and naive flagging produces too many false
-    positives. Input capped at 100,000 characters.
+    No context is read: times, dates and section numbers (10.30, 14.05,
+    3.2) and three-place decimals (1,250 kg) can be flagged too. Spelling
+    out small numbers is not checked.
     """
     return _check_numbers(text)
 
@@ -2917,32 +2781,17 @@ def check_numbers(text: Annotated[str, Field(description="Estonian text to check
     openWorldHint=False,
 ))
 @_counted
-def check_capitalization(text: Annotated[str, Field(description="Estonian text to check for capitalization errors (Algustäheortograafia).")]) -> _CheckResult:
-    """Heuristic Estonian capitalization checker (Algustäheortograafia).
+def check_capitalization(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags words wrongly capitalized mid-sentence (algustäheortograafia):
+    - `weekday`, `month`, `nationality`: lowercase except at sentence
+      start (esmaspäeval, jaanuaris, eestlane).
+    - `language-adjective`: a country name before a language or culture
+      noun is lowercase (eesti keel, vene kultuur). On its own it is the
+      country (Eesti, Eestis) and is not flagged.
 
-    Scans Estonian text for the most common AI-generated capitalization
-    errors per EKI's Reeglid:
-
-    - Weekday names capitalized mid-sentence (Esmaspäeval → esmaspäeval)
-    - Month names capitalized mid-sentence (Jaanuaris → jaanuaris)
-    - Nationality names capitalized mid-sentence (Eestlane → eestlane)
-    - Country/language adjectives capitalized before a culture or
-      language noun (Eesti keel → eesti keel; Eesti köök → eesti köök).
-      The bare capitalized form on its own (Eesti, Eestis) is left
-      alone because it's a valid country proper-noun usage.
-
-    Sentence-initial capitalization is always allowed. All-caps
-    acronyms are ignored. Returns each issue with rule code, an
-    Estonian rule label (`rule_estonian`: quote this verbatim in
-    Estonian replies, don't translate the English `rule`), a
-    user-facing explanation, and a suggested correction. Input capped
-    at 100,000 characters.
-
-    PHASE-1 LIMITATION: this is a lexicon-based heuristic, not a full
-    EÕS implementation. Compound-word capitalization, punctuation
-    rules, and hyphenation are NOT covered by this tool (separate
-    check_compounds / check_punctuation / check_hyphenation tools may
-    follow).
+    Sentence-initial words and all-caps acronyms are skipped. A hit that
+    opens a line, list item or quotation, or sits in a proper name (Eesti
+    Keele Instituut), is usually false.
     """
     return _check_capitalization(text)
 
@@ -3019,7 +2868,8 @@ def _familiarity_verdict(
     so the similarity is under the gate. The only configuration where the
     model has something to say and what it says is bad.
 
-    Subword-echo overlap is COUNTED and surfaced but never triggers: real
+    Subword-echo overlap is COUNTED in the returned quality (the tool
+    shows the caller only its `signal`) but never triggers: real
     sibling compounds share a head morpheme too (tervisekindlustus ↔
     ravikindlustus). Nor does the junk RATIO over the neighbour tail: a
     junky tail behind a real top neighbour describes how sparse that
@@ -3058,9 +2908,10 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
 
     For each compound noun (Vabamorf root_tokens of length >= 2) in the
     text, ask two lexicons whether the lemma is attested (the fastText
-    model's 100K-word corpus vocabulary and Estonian WordNet), and look
-    up its fastText nearest neighbours. An attested compound is reported
-    as attested. An unattested one is flagged only in the single
+    model's 100K-word corpus vocabulary and Estonian WordNet). An attested
+    compound is reported as attested, and its neighbours are not searched:
+    they cannot change the verdict. An unattested one carries its fastText
+    nearest neighbours, and is flagged only in the single
     configuration where the model has something to say and what it says
     is bad: its nearest neighbour is a real word and even that similarity
     is under the gate. The decision lives in `_familiarity_verdict` (a
@@ -3074,9 +2925,10 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
 
     `neighbours=False` is check_domain_terms' path. That tool reads only
     attestation, so the fastText neighbour search, nearly all of the cost
-    (~0.15 s a compound), is skipped and no verdict is reached. Each
-    compound carries `forms` instead: every lemma reading and surface form
-    the text has for it (see _word_forms).
+    (~0.15 s a compound), is skipped and no verdict is reached. Entries
+    carry no neighbours, and neighbour_quality only for a legal term
+    ({"legal_term": true}). Each compound carries `forms` instead: every
+    lemma reading and surface form the text has for it (see _word_forms).
     """
     _check_text(text)
     Text = _Text()
@@ -3124,20 +2976,15 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
         seen.add(lemma)
 
         in_vocab = lemma in vocab
-        try:
-            nearest = kv.most_similar(lemma, topn=8) if neighbours else []
-        except KeyError:
-            nearest = []
-        top_score = float(nearest[0][1]) if nearest else 0.0
 
         # Second attestation source. Specialised legal compounds
         # (õigussuhe, solidaarvõlgnik, abieluvaraleping) are OOV in the
         # general-web fastText vocab and used to be false-flagged as
         # coinages (~15% of legal compounds); a known term of art is real
-        # by definition, and so is a WordNet lemma. The markers are
-        # stamped for every hit, not only where a verdict had to be
-        # rescued, because the caller wants to know which lexicon vouched
-        # for the word.
+        # by definition, and so is a WordNet lemma. Both are marked for
+        # every hit, because the caller wants to know which lexicon
+        # vouched for the word: WordNet in `in_wordnet`, the legal list in
+        # `neighbour_quality.legal_term`.
         legal_term = _is_legal_term(lemma)
         in_wordnet: bool | None = None
         if wn is not None and wordnet_lookups < _FAMILIARITY_WORDNET_CAP:
@@ -3146,37 +2993,45 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
                 in_wordnet = bool(wn[lemma])
             except Exception:
                 in_wordnet = None
+        attested = bool(in_vocab or in_wordnet or legal_term)
+
+        # Attested ends the verdict, so the neighbours of an attested
+        # lemma could only be shown, never weighed: the search runs for
+        # unattested lemmas only.
+        search = neighbours and not attested
+        try:
+            nearest = kv.most_similar(lemma, topn=8) if search else []
+        except KeyError:
+            nearest = []
+        top_score = float(nearest[0][1]) if nearest else 0.0
 
         # Verdict (pure, see _familiarity_verdict): attested lemmas pass;
         # an unattested one is flagged only when its nearest neighbour is
         # a real word and that similarity is still under the gate.
-        is_suspect, reasons, quality = _familiarity_verdict(
+        is_suspect, _, quality = _familiarity_verdict(
             in_vocab, top_score, nearest, parts,
             attested_elsewhere=bool(in_wordnet) or legal_term,
         )
-        if legal_term:
-            quality = {**quality, "legal_term": True}
-        if in_wordnet:
-            quality = {**quality, "wordnet": True}
 
-        compounds.append({
+        entry = {
             "word": span.text,
             "lemma": lemma,
             "parts": parts,
             "position": span.start,
             "in_vocab": in_vocab,
             "in_wordnet": in_wordnet,
-            "attested": bool(in_vocab or in_wordnet or legal_term),
-            "top_score": round(top_score, 3),
-            "top_neighbour": nearest[0][0] if nearest else None,
-            "neighbours": [
+            "attested": attested,
+        }
+        if search:
+            entry["neighbours"] = [
                 {"word": n, "score": round(float(s), 3)}
                 for n, s in nearest[:5]
-            ],
-            "neighbour_quality": quality,
-            "is_suspect": is_suspect,
-            "reasons": reasons,
-        })
+            ]
+            entry["neighbour_quality"] = {"signal": quality["signal"]}
+        if legal_term:
+            entry.setdefault("neighbour_quality", {})["legal_term"] = True
+        entry["is_suspect"] = is_suspect
+        compounds.append(entry)
 
     glossary = _domain_glossary_or_empty()
     for c in compounds:
@@ -3185,15 +3040,14 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
         if not neighbours:
             c["forms"] = sorted(forms)
 
-    suspects = [c for c in compounds if c["is_suspect"]]
+    suspects = [c["lemma"] for c in compounds if c["is_suspect"]]
     unattested = [c for c in compounds if not c["attested"]]
     listed = sum(1 for c in unattested if c.get("in_domain_glossary"))
 
-    return {
-        "text": text,
+    result = {
         "compounds_analysed": len(compounds),
         "suspect_compounds": suspects,
-        "unattested_compounds": unattested,
+        "unattested_compounds": [c["lemma"] for c in unattested],
         "wordnet_checked": wn is not None,
         "all_compounds": compounds,
         "summary_estonian": (
@@ -3206,48 +3060,19 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
                 f"valdkonna sõnastikus." if listed else ""))
             if compounds else "Liitsõnanimisõnu analüüsiks ei leitud."
         ),
-        "note": (
-            "Attestation check for compound nouns. TWO lexicons are asked "
-            "whether the lemma is attested: the fastText model's 100K-word "
-            "corpus vocabulary (`in_vocab`) and Estonian WordNet "
-            "(`in_wordnet`; `wordnet_checked` says whether the resource was "
-            "available). Either one, or a known legal term of art, sets "
-            "`attested: true` and ends the matter. READ `attested` BEFORE "
-            "`is_suspect`. Unattested is the NORMAL state for correct "
-            "specialist vocabulary: `lisakäive`, `klikkimismäär`, "
-            "`koolitoit`, `rehvivahetus`, `hinnakujundus` and "
-            "`otsingureklaam` are every one of them ordinary Estonian and "
-            "every one of them unattested here, because a 100K vocabulary "
-            "holds a fraction of a language that compounds as freely as "
-            "Estonian does. Unattested is NOT evidence that a word was "
-            "invented and on its own is never a reason to rewrite. "
-            "`is_suspect` is narrower: unattested AND the nearest "
-            "neighbour is a real word AND that similarity is still under "
-            "0.55, the one configuration in which the model has something "
-            "to say and what it says is bad ('mõtteliin', 0.536, literal "
-            "English 'train of thought'; real Estonian is 'mõttekäik'). "
-            "When `neighbour_quality.signal` is `none` the nearest "
-            "neighbour is a scrape-artifact token rather than a word: "
-            "fastText fell back to character n-grams and landed in a hub, "
-            "so the score there means nothing in either direction and "
-            "nothing is claimed. RECALL IS LOW BY DESIGN. Coinages whose "
-            "score lands in the band real vocabulary occupies are missed "
-            "on purpose ('toortõlkeoht', 0.571, sits eight thousandths "
-            "from attested 'hinnakujundus', 0.563): the alternative was a "
-            "gate that reported a quarter of ordinary business Estonian as "
-            "invented. Judge a flag yourself from the `neighbours` list: "
-            "coherent related words (tervisekindlustus → ravikindlustus, "
-            "elukindlustus) mean the compound is real. And note what "
-            "similarity cannot see at all: a well-formed but STILTED "
-            "compound ('teadusandmestik', 0.705) passes here, so use "
-            "check_officialese and classify_register for register."
-            + (" This server has a domain glossary, so each compound also "
-               "carries `in_domain_glossary`: true means the organisation "
-               "lists the word, so treat it as real; a listed compound is "
-               "never `is_suspect`. check_domain_terms checks a text "
-               "against the glossary." if glossary else "")
-        ),
     }
+    # WordNet gave no answer for an unattested lemma, so it might still be
+    # there: unavailable, past the lookup cap, or a lookup that failed.
+    if any(c["in_wordnet"] is None and not c["attested"] for c in compounds):
+        result["note"] = (
+            "WordNet was unavailable (`wordnet_checked: false`), so "
+            "`attested` rests on the corpus vocabulary and the legal terms "
+            "list alone." if wn is None else
+            "Where `in_wordnet` is null, WordNet was not asked (it is asked "
+            f"about the first {_FAMILIARITY_WORDNET_CAP} compounds only) or "
+            "the lookup failed, so `attested` there rests on the corpus "
+            "vocabulary and the legal terms list alone.")
+    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -3257,44 +3082,27 @@ def _check_compound_familiarity(text: str, *, neighbours: bool = True) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_compound_familiarity(text: Annotated[str, Field(description="Estonian text whose compound nouns are checked against the corpus vocabulary and WordNet.")]) -> _CompoundFamiliarityResult:
-    """Attestation check for Estonian compound nouns, evidence attached.
+def check_compound_familiarity(text: Annotated[str, Field(description="Estonian text to check.")]) -> _CompoundFamiliarityResult:
+    """Attestation check for Estonian compound nouns; use it on compounds you
+    coined.
 
-    For each compound noun (root_tokens length >= 2) it reports
-    `attested`: whether the lemma is in the fastText model's 100K-word
-    corpus vocabulary (`in_vocab`), in Estonian WordNet (`in_wordnet`),
-    or on the legal terms-of-art list. It returns the top fastText
-    neighbours with it, a `top_score` similarity and a
-    `neighbour_quality` breakdown.
+    A compound is `attested` when its lemma is in the fastText 100K-word
+    corpus vocabulary (`in_vocab`), Estonian WordNet (`in_wordnet`) or the
+    legal terms list (`neighbour_quality.legal_term`). Read `attested` first:
+    false is normal for correct specialist words, not evidence of invention,
+    and never on its own a reason to rewrite.
 
-    READ `attested` FIRST, and read `attested: false` for what it is: the
-    lemma is outside a 100K-word vocabulary. That is the normal state for
-    correct specialist vocabulary in a language that compounds as freely
-    as Estonian. `lisakäive`, `klikkimismäär`, `koolitoit`,
-    `rehvivahetus`, `hinnakujundus`, `otsingureklaam` are all unattested
-    here and all ordinary Estonian. On its own it is never a reason to
-    rewrite anything.
+    `is_suspect` is narrow: unattested, and the nearest neighbour is a real
+    word scoring under 0.55 (`mõtteliin`). Judge a flag from `neighbours`
+    (unattested entries only): coherent related words mean the word is
+    real. `neighbour_quality.signal: "none"`: the nearest neighbour is
+    scrape junk, so there is no verdict. Recall is low on purpose: some
+    coinages pass, and so does any stilted compound (check register with
+    check_officialese).
 
-    `is_suspect` is the narrow case: unattested AND the nearest neighbour
-    is a real word AND that similarity is under 0.55: the one
-    configuration where the model has something to say and what it says is
-    bad. `mõtteliin` (0.536, literal English "train of thought"; real
-    Estonian `mõttekäik`) flags. Recall is low on purpose: a coinage
-    scoring inside the band real vocabulary occupies is missed rather than
-    bought at the price of flagging ordinary Estonian, so `toortõlkeoht`
-    (0.571) passes.
-
-    When `neighbour_quality.signal` is `none`, the nearest neighbour is a
-    scrape-artifact token rather than a word, the similarity means nothing
-    in either direction, and no verdict is offered.
-
-    When the server has a domain glossary (ESTNLTK_MCP_DOMAIN_GLOSSARY),
-    each compound also carries `in_domain_glossary`. True means the
-    organisation lists the word: treat it as real, and it is never
-    `is_suspect`. To check a text against a glossary of your own, use
-    check_domain_terms.
-
-    Input capped at 100,000 characters.
+    `in_domain_glossary: true` (only with a server glossary): the
+    organisation's own word, so treat it as real. For your own glossary use
+    check_domain_terms. Proper nouns are skipped.
     """
     return _check_compound_familiarity(text)
 
@@ -3467,7 +3275,6 @@ def _domain_mark(compound: dict, forms: set[str], glossary: frozenset[str]) -> d
         compound["in_domain_glossary"] = listed
         if listed and compound.get("is_suspect"):
             compound["is_suspect"] = False
-            compound["reasons"] = []
     return compound
 
 
@@ -3540,9 +3347,11 @@ def _domain_terms_from(compounds: list[dict], terms: frozenset[str],
     Suggestions are the closest glossary lemmas by spelling similarity
     (difflib), not fastText, because a glossary term is usually outside
     the model vocabulary too. They are look-alikes, not synonyms, and never
-    a term the compound is built on. Only the first `cap` reported
-    compounds, within `seconds`, get suggestions and a
-    `contains_glossary_term`; the rest carry None in both."""
+    a term the compound is built on, which `contains_glossary_term` names
+    when there is one. Only the first `cap` reported compounds, within
+    `seconds`, are compared: the rest carry `suggestions` None and no
+    `contains_glossary_term`. With no terms there is nothing to compare,
+    and neither key is set."""
     ranked = sorted(terms)
     deadline = time.monotonic() + seconds
     unlisted = []
@@ -3556,17 +3365,19 @@ def _domain_terms_from(compounds: list[dict], terms: frozenset[str],
             "lemma": lemma,
             "position": c["position"],
             "in_wordnet": c.get("in_wordnet"),
-            "contains_glossary_term": None,
-            "suggestions": None,
         }
-        hits = _look_alikes(lemma, ranked, cutoff, deadline) if len(unlisted) < cap else None
-        if hits is not None:
-            found = _domain_parts_found(lemma, c.get("parts") or [], terms) if terms else set()
-            entry["contains_glossary_term"] = max(sorted(found), key=len) if found else None
-            entry["suggestions"] = [
-                {"term": t, "similarity": round(score, 3)}
-                for score, t in heapq.nlargest(3, [h for h in hits if h[1] not in found])
-            ]
+        if terms:
+            hits = _look_alikes(lemma, ranked, cutoff, deadline) if len(unlisted) < cap else None
+            suggestions = None
+            if hits is not None:
+                found = _domain_parts_found(lemma, c.get("parts") or [], terms)
+                if found:
+                    entry["contains_glossary_term"] = max(sorted(found), key=len)
+                suggestions = [
+                    {"term": t, "similarity": round(score, 3)}
+                    for score, t in heapq.nlargest(3, [h for h in hits if h[1] not in found])
+                ]
+            entry["suggestions"] = suggestions
         unlisted.append(entry)
     return unlisted
 
@@ -3587,7 +3398,7 @@ def _domain_terms_summary(analysed: int, unlisted: list[dict], lists_given: bool
     if not k:
         return ("Kõik leitud liitsõnanimisõnad on sõnavaras, tesauruses, "
                 "õigusterminite loendis või valdkonna loendites.")
-    s = sum(1 for u in unlisted if u["suggestions"])
+    s = sum(1 for u in unlisted if u.get("suggestions"))
     return (
         f"Tuvastati {analysed} liitsõnanimisõna; {k} neist ei leidu ei "
         f"sõnavaras, tesauruses, õigusterminite loendis ega valdkonna "
@@ -3613,52 +3424,35 @@ def _check_domain_terms(text: str, glossary: list[str] | None = None,
             f"not {suggest_cutoff}")
     fam = _check_compound_familiarity(text, neighbours=False)
     unlisted = _domain_terms_from(fam["all_compounds"], terms, allowed, cutoff)
-    return {
-        "text": text,
+    capped = any("suggestions" in u and u["suggestions"] is None for u in unlisted)
+    result = {
         "glossary_size": len(terms),
         "identifiers_size": len(identifiers),
         "suggest_cutoff": cutoff,
         "compounds_analysed": fam["compounds_analysed"],
         "wordnet_checked": fam["wordnet_checked"],
         "unlisted_compounds": unlisted,
-        "suggestions_capped": any(u["suggestions"] is None for u in unlisted),
+        "suggestions_capped": capped,
         "summary_estonian": _domain_terms_summary(
             fam["compounds_analysed"], unlisted, bool(allowed)),
-        "note": (
-            "Compounds that are unattested (not in the corpus vocabulary, "
-            "WordNet or the legal terms list) AND not listed: not in the "
-            "domain glossary (the server's ESTNLTK_MCP_DOMAIN_GLOSSARY file "
-            "plus any `glossary` passed with this call) and not in the "
-            "identifier list (ESTNLTK_MCP_DOMAIN_IDENTIFIERS). A compound is "
-            "listed when any lemma reading of it, or the word as written, "
-            "is on a list. A reported compound is not necessarily coined: "
-            "unattested is the normal state of much ordinary Estonian "
-            "(`vagunisõit` is common, and outside the 100K vocabulary). "
-            "What the report says is only that it is not the "
-            "organisation's word. Where it names something the "
-            "organisation has a term for, or something with an "
-            "identifier, use theirs; otherwise leave it. `suggestions` are glossary "
-            "terms SPELLED alike (difflib similarity of at least "
-            "`suggest_cutoff`), not synonyms: replace the compound only "
-            "when a suggestion names the same thing, and otherwise leave "
-            "it. `contains_glossary_term` names a glossary term the "
-            "compound is built on (`vagunireisitabel` on `vagunireis`). "
-            "That is ordinary Estonian on the organisation's word, so ask "
-            "only whether the thing it names has its own term or "
-            "identifier. Suggestions are computed for the first "
-            f"{_DOMAIN_SUGGEST_CAP} reported compounds, within "
-            f"{_DOMAIN_SUGGEST_SECONDS:g} seconds a call; past either, both "
-            "fields are null and `suggestions_capped` is true. With no "
-            "glossary and no identifier list (`glossary_size` 0, as on the "
-            "hosted server unless you pass `glossary`) this is simply the "
-            "unattested list, and unattested alone is never a reason to "
-            "rewrite (see check_compound_familiarity). WordNet is asked "
-            f"about the first {_FAMILIARITY_WORDNET_CAP} compounds only: "
-            "`in_wordnet: null` on a reported compound means it was not "
-            "asked, so the word may still be ordinary Estonian. Words "
-            "with a capitalised lemma (proper-noun-like) are not examined."
-        ),
     }
+    notes = []
+    if capped:
+        notes.append(
+            f"Suggestions stop after {_DOMAIN_SUGGEST_CAP} reported compounds "
+            f"or {_DOMAIN_SUGGEST_SECONDS:g} seconds, whichever comes first; "
+            "later entries have `suggestions: null` and were not checked "
+            "for `contains_glossary_term`.")
+    if any(u["in_wordnet"] is None for u in unlisted):
+        notes.append(
+            "WordNet was unavailable (`wordnet_checked: false`), so it may "
+            "still list a reported compound." if not fam["wordnet_checked"] else
+            "Where `in_wordnet` is null, WordNet was not asked (it is asked "
+            f"about the first {_FAMILIARITY_WORDNET_CAP} compounds only) or "
+            "the lookup failed, so it may still list that word.")
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -3669,36 +3463,30 @@ def _check_domain_terms(text: str, glossary: list[str] | None = None,
 ))
 @_counted
 def check_domain_terms(
-    text: Annotated[str, Field(description="Estonian text whose compound nouns are checked against the corpus, WordNet and the domain glossary.")],
-    glossary: Annotated[list[_GlossaryTerm] | None, Field(max_length=MAX_GLOSSARY_TERMS, description="Optional domain lemmas (base forms), used for this call only alongside the server's ESTNLTK_MCP_DOMAIN_GLOSSARY file. Nothing is stored. Up to 1,000 terms of up to 200 characters each.")] = None,
-    suggest_cutoff: Annotated[float | None, Field(ge=_DOMAIN_SUGGEST_CUTOFF_MIN, le=1.0, description="Spelling similarity, 0.4 to 1, that a glossary term needs to be suggested. Defaults to the server's ESTNLTK_MCP_DOMAIN_SUGGEST_CUTOFF, else 0.6.")] = None,
+    text: Annotated[str, Field(description="Estonian text to check.")],
+    glossary: Annotated[list[_GlossaryTerm] | None, Field(max_length=MAX_GLOSSARY_TERMS, description="Domain lemmas (base forms), added to the server's glossary for this call only. Not stored.")] = None,
+    suggest_cutoff: Annotated[float | None, Field(ge=_DOMAIN_SUGGEST_CUTOFF_MIN, le=1.0, description="Minimum spelling similarity for a glossary term to be suggested. Default: the server's setting, else 0.6.")] = None,
 ) -> _DomainTermsResult:
-    """Flags compounds that no lexicon and no domain glossary vouches for.
+    """Reports compounds no lexicon or domain glossary vouches for, in Estonian
+    you wrote about an organisation's own systems.
 
     A compound is reported when it is unattested (see
-    check_compound_familiarity) AND absent from the operator's glossary
-    (ESTNLTK_MCP_DOMAIN_GLOSSARY, one lemma per line), the identifier list
-    (ESTNLTK_MCP_DOMAIN_IDENTIFIERS) and the per-call `glossary`. Any
-    lemma reading of the word, or the word as written, counts as listed.
+    check_compound_familiarity) and absent from the server's glossary and
+    identifier list and your `glossary`. A reported compound is not
+    necessarily coined: it is only not the organisation's word, and may be
+    ordinary Estonian (`vagunisõit` is). Where it names something the
+    organisation has a term or identifier for, use theirs; otherwise leave
+    it.
 
-    Use it on Estonian you wrote about an organisation's own systems. A
-    reported compound is not the organisation's word, which is all the
-    report says: it may be a coinage, or ordinary Estonian the lexicons
-    lack (`vagunisõit` is common). Where it names something the
-    organisation has a term or an identifier for, use theirs.
+    `suggestions` are glossary terms SPELLED alike, not synonyms: use one only
+    if it names the same thing. `contains_glossary_term` is the term the
+    compound is built on (`vagunireisitabel` on `vagunireis`): ordinary
+    Estonian, not to be shortened to the term; ask only whether the thing it
+    names has its own term.
 
-    Each reported compound carries up to three `suggestions`: glossary
-    terms spelled alike, with their similarity. They are look-alikes, not
-    synonyms, so replace the compound only when a suggestion names the
-    same thing. `contains_glossary_term` marks a compound built on a
-    glossary term (`vagunireisitabel` on `vagunireis`), which is ordinary
-    Estonian and is not to be shortened to the term.
-
-    The hosted server has no glossary of its own: pass your terms in
-    `glossary`. With none at all, the report is just the unattested list,
-    which on its own is never a reason to rewrite.
-
-    Input capped at 100,000 characters; `glossary` at 1,000 terms.
+    The hosted server has no glossary: pass yours in `glossary`. Without one
+    this is the unattested list, never on its own a reason to rewrite.
+    Proper nouns are skipped.
     """
     return _check_domain_terms(text, glossary, suggest_cutoff)
 
@@ -3747,33 +3535,14 @@ def _check_abbreviation_hyphenation(text: str) -> dict:
             "position": span.start,
             "rule": "abbreviation-case-ending-hyphen",
             "rule_estonian": "lühendi käändelõpu sidekriips",
-            "explanation": (
-                f"In Estonian, case endings on Latin-letter abbreviations "
-                f"are separated by a hyphen (EKI Reeglid: lühendi-"
-                f"ortograafia). '{word}' should be written as "
-                f"'{suggestion}'."
-            ),
             "suggestion": suggestion,
         })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} lühendi käändelõpu sidekriipsu viga." if issues
             else "Lühendiortograafia probleeme ei leitud."
-        ),
-        "note": (
-            "Heuristic checker for the EKI Reeglid rule that case "
-            "endings on abbreviations are hyphen-separated (MCP-st, "
-            "API-ga, OÜ-le). Uses Vabamorf's Y-pos tag + case form "
-            "analysis, so we only flag tokens Vabamorf actually "
-            "recognised as abbreviations carrying a case ending. "
-            "Single-letter endings on short capital sequences are not "
-            "specially filtered: relies on Vabamorf to know whether "
-            "'APIs' is an abbreviation plus inessive ending or just "
-            "an English plural. Quote rule_estonian verbatim in "
-            "Estonian replies."
         ),
     }
 
@@ -3785,19 +3554,13 @@ def _check_abbreviation_hyphenation(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_abbreviation_hyphenation(text: Annotated[str, Field(description="Estonian text to check for abbreviation case-ending hyphenation (MCPst → MCP-st).")]) -> _CheckResult:
-    """Heuristic check for the EKI Reeglid rule that case endings on
-    Latin-letter / all-caps abbreviations are separated by a hyphen.
+def check_abbreviation_hyphenation(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags a case ending on an abbreviation written without a hyphen:
+    MCPst → MCP-st, APIga → API-ga, OÜle → OÜ-le.
 
-    Catches the common AI mistake of writing `MCPst`, `APIga`, `OÜle`
-    instead of `MCP-st`, `API-ga`, `OÜ-le`. Uses Vabamorf's POS+form
-    analysis to identify tokens recognised as abbreviations carrying a
-    case ending; only flags those that aren't already hyphenated.
-
-    Phase-1 scope: matches what Vabamorf tags as `Y` (abbreviation).
-    Custom acronyms Vabamorf doesn't know (your brand acronym, niche
-    industry shorthand) won't be flagged because Vabamorf doesn't see
-    them as abbreviations. Input capped at 100,000 characters.
+    Any all-capital stem counts, known or not; mixed-case ones (SaaS, PhD,
+    iOS) are not checked. An English plural looks like a case ending
+    (APIs → API-s): check such hits.
     """
     return _check_abbreviation_hyphenation(text)
 
@@ -3902,14 +3665,6 @@ def _check_object_case(text: str) -> dict:
                     "form": form,
                     "rule": "negation-requires-partitive",
                     "rule_estonian": "eitus nõuab osastavat",
-                    "explanation": (
-                        f"Estonian negation (ei/pole/ära/…) requires "
-                        f"direct objects in the partitive case. "
-                        f"'{word}' is in {form!r} (nominative/genitive); "
-                        f"a partitive form of '{lemma}' is likely "
-                        f"expected here."
-                    ),
-                    "suggestion_hint": f"consider partitive form of '{lemma}'",
                 })
             elif partitive_verb:
                 issues.append({
@@ -3920,30 +3675,13 @@ def _check_object_case(text: str) -> dict:
                     "verb": partitive_verb,
                     "rule": "partitive-only-verb",
                     "rule_estonian": "osastavat nõudev tegusõna",
-                    "explanation": (
-                        f"The verb '{partitive_verb}' takes its direct "
-                        f"object in the partitive case. '{word}' is in "
-                        f"{form!r} (nominative/genitive); a partitive "
-                        f"form of '{lemma}' is likely expected."
-                    ),
-                    "suggestion_hint": f"consider partitive form of '{lemma}'",
                 })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} käändevigade kahtlust." if issues
             else "Käändevigade kahtlust ei leitud."
-        ),
-        "note": (
-            "Heuristic phase-1 object-case checker: no syntactic parser, "
-            "so we can't distinguish subjects from objects. Flags nouns "
-            "in nominative/genitive in sentences with negation or "
-            "partitive-only verbs. Subjects of those sentences may be "
-            "false-positive flags. Treat as 'worth a second look', not "
-            "authoritative corrections. When surfacing rule labels in "
-            "Estonian replies, quote rule_estonian verbatim."
         ),
     }
 
@@ -3955,27 +3693,17 @@ def _check_object_case(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_object_case(text: Annotated[str, Field(description="Estonian text to check for direct-object case errors under negation and partitive-governing verbs.")]) -> _CheckResult:
-    """Heuristic Estonian object-case-government check.
+def check_object_case(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags a direct object in the wrong case (käändeõpetus): a common noun
+    in nominative or genitive (`form`) after
+    - `negation-requires-partitive`: negation (ei söönud leib → leiba), or
+    - `partitive-only-verb`: `verb`, one of nine verbs such as armastama,
+      vajama and ootama that always take a partitive object.
 
-    Catches the single biggest class of confidently-wrong Estonian that
-    AI agents produce: direct objects in the wrong case after negation
-    or after partitive-governing verbs.
-
-    Two rules in phase 1:
-    - **Negation → partitive**: any sentence containing 'ei', 'pole',
-      'ära', 'ärge', 'ärgu', 'ärgem', or 'mitte' must have direct
-      objects in partitive. Flags nominative / genitive nouns.
-    - **Partitive-only verbs**: the verbs `armastama`, `vihkama`,
-      `vajama`, `soovima`, `ootama`, `austama`, `kartma`, `puudutama`,
-      `tundma` always take partitive direct objects. Flags any noun
-      in nominative/genitive in the same sentence.
-
-    Phase-1 limitation: no syntactic parser, so we can't perfectly
-    distinguish subject from object. Subjects in negation/partitive-verb
-    sentences may be flagged as false positives. Treat hits as "worth a
-    second look", not authoritative. Proper nouns are skipped. Input
-    capped at 100,000 characters.
+    The negation rule skips any sentence containing olema (pole, ei ole,
+    pole näinud). The fix is the partitive of `lemma` in the number `form`
+    shows; take it from paradigm. With no parser, a hit may be a subject or
+    an adverbial, so treat it as worth a second look.
     """
     return _check_object_case(text)
 
@@ -4055,20 +3783,10 @@ def _check_redundancy(text: str) -> dict:
                 })
 
     return {
-        "text": text,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(issues)} liiasuse (pleonasmi) kahtlust."
             if issues else "Liiasust ei tuvastatud."
-        ),
-        "note": (
-            "Heuristic pleonasm checker. Flags high-confidence semantic "
-            "doubling: adjacent 'also' particles (samuti ka), double "
-            "superlatives (kõige optimaalsem), and a small set of fixed "
-            "redundant phrases. Deliberately conservative; it does NOT "
-            "catch every redundancy a native speaker would hear, so "
-            "absence of flags is not proof the text is tight. Quote "
-            "rule_estonian verbatim in Estonian replies."
         ),
     }
 
@@ -4080,26 +3798,17 @@ def _check_redundancy(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_redundancy(text: Annotated[str, Field(description="Estonian text to check for pleonasm / redundant word pairs.")]) -> _CheckResult:
-    """Heuristic Estonian pleonasm / semantic-doubling check.
+def check_redundancy(text: Annotated[str, Field(description="Estonian text.")]) -> _CheckResult:
+    """Flags redundant doubling (liiasus, pleonasm):
+    - `doubled-also`: two "also" particles together (samuti ka, ka samuti,
+      ühtlasi ka); keep one.
+    - `double-superlative`: kõige before an absolute adjective (kõige
+      optimaalsem, "most optimal"); drop kõige.
+    - `fixed-pleonasm`: a short curated list (ajaline periood, väike
+      nüanss, üldine konsensus).
 
-    Flags phrasing that is grammatically valid but reads redundant to a
-    native speaker, the class of error AI agents produce when they
-    stack synonyms. Phase-1 rules, all high-precision:
-
-    - **Doubled 'also' particles**: `samuti ka`, `ka samuti`,
-      `ühtlasi ka`. Both words mean "also/too", so together they're a
-      tautology. (This is the exact `samuti ka suvesärgid` case.)
-    - **Double superlative**: `kõige` before an already-absolute
-      adjective (`optimaalne`, `ideaalne`, `maksimaalne`, `täiuslik`,
-      `ainus`, …), like English "most optimal". Lemma-matched, so all
-      inflected forms count.
-    - **Fixed pleonasm phrases**: a small curated set (`ajaline
-      periood`, `väike nüanss`, `üldine konsensus`, …).
-
-    Conservative by design: it catches the obvious, high-confidence
-    cases, not every redundancy. Absence of flags is not proof the
-    prose is tight. Input capped at 100,000 characters.
+    Each issue's `explanation` gives the reason in Estonian. Conservative:
+    it misses much redundancy a native speaker would hear.
     """
     return _check_redundancy(text)
 
@@ -4172,33 +3881,17 @@ def _check_legalese(text: str) -> dict:
                 "position": sent.start,
                 "rule": "complex-sentence",
                 "rule_estonian": "liiga pikk/keeruline lause",
-                "explanation": (
-                    f"Lause on {n_words} sõna ja {n_commas} koma. Kaalu "
-                    f"jagamist lühemateks lauseteks, termineid muutmata."
-                ),
+                "explanation": f"Lause on {n_words} sõna ja {n_commas} koma.",
                 "suggestion": "jaga lause lühemateks osadeks",
             })
 
     return {
-        "text": text,
         "issues": issues,
         "terms_of_art": terms,
         "summary_estonian": (
             f"Leiti {len(issues)} lihtsustamiskohta; säilitada tuleb "
             f"{len(terms)} juriidilist terminit." if (issues or terms)
             else "Kantseliiti ega juriidilisi termineid ei tuvastatud."
-        ),
-        "note": (
-            "Heuristic legalese-simplification aid. `issues` flags archaic "
-            "'kantseliit' filler (käesolev → see, juhul kui → kui) and "
-            "over-long / over-nested sentences that can be split, WITHOUT "
-            "changing legal meaning. `terms_of_art` lists specialised legal "
-            "terms detected that MUST be preserved verbatim when simplifying: "
-            "replacing e.g. 'vastutus' or 'hagi' with a general synonym would "
-            "change the legal meaning. STARTER lexicons, precision-first and "
-            "not exhaustive: absence of flags is not proof the text is plain, "
-            "and terms_of_art will miss terms not yet in the list. Quote "
-            "rule_estonian verbatim in Estonian replies."
         ),
     }
 
@@ -4269,24 +3962,12 @@ def _check_defined_terms(text: str) -> dict:
              for m in _XREF_RE.finditer(text)]
 
     return {
-        "text": text if len(text) <= 2000 else text[:2000] + "…",
         "defined_terms": defined_terms,
         "cross_references": xrefs,
         "issues": issues,
         "summary_estonian": (
             f"Leiti {len(defined_terms)} defineeritud mõistet, {len(xrefs)} "
             f"viidet ja {len(issues)} probleemi."
-        ),
-        "note": (
-            "Structural check for long legal documents. defined_terms maps "
-            "each '(edaspidi «X»)' definition to how many times the term "
-            "actually occurs; cross_references lists § / lõige / punkt / "
-            "artikkel references (surfaced, not validated). issues flags "
-            "defined-but-unused and doubly-defined terms. Regex-based and "
-            "PII-free (nothing stored); input cap is raised to 500,000 chars "
-            "so whole contracts fit. `text` is truncated to a 2,000-char "
-            "preview in the response. Quote rule_estonian verbatim in "
-            "Estonian replies."
         ),
     }
 
@@ -4298,20 +3979,17 @@ def _check_defined_terms(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_legalese(text: Annotated[str, Field(description="Estonian legal text to lint for plain-language simplification while protecting legal terms of art.")]) -> _LegaleseResult:
-    """Aid for simplifying Estonian legal text WITHOUT losing legal precision.
+def check_legalese(text: Annotated[str, Field(description="Estonian statute or contract text.")]) -> _LegaleseResult:
+    """Plain-language aid for Estonian statutes and contracts; rewrites
+    must keep the legal meaning.
 
-    Returns two things:
-    - `issues`: archaic 'kantseliit' filler with plain equivalents
-      (`käesolev` → `see`, `juhul kui` → `kui`), plus over-long / heavily
-      subordinated sentences worth splitting.
-    - `terms_of_art`: specialised legal terms detected in the text that
-      MUST be kept verbatim when rewriting. Swapping `hagi` or `vastutus`
-      for a general synonym changes the legal meaning. Use this as a
-      do-not-touch list while you simplify.
-
-    Heuristic, precision-first, backed by curated starter lexicons (not
-    exhaustive). Input capped at 100,000 characters.
+    issues: archaic filler and stock phrases with a plainer suggestion,
+    and over-long or comma-heavy sentences to split. terms_of_art: legal
+    terms (first use per lemma) to keep verbatim, never swapped for a
+    general synonym.
+    Starter lexicons: an empty or short issues list does not mean the
+    text is plain, and an unlisted word can still be a term of art. For
+    reports and business prose use check_officialese.
     """
     return _check_legalese(text)
 
@@ -4323,17 +4001,15 @@ def check_legalese(text: Annotated[str, Field(description="Estonian legal text t
     openWorldHint=False,
 ))
 @_counted
-def check_defined_terms(text: Annotated[str, Field(description="A long Estonian legal document to map defined terms ('edaspidi «X»') and § / lõige / punkt cross-references.")]) -> _DefinedTermsResult:
-    """Structural map of a long Estonian legal document.
+def check_defined_terms(text: Annotated[str, Field(description="Whole Estonian legal document.")]) -> _DefinedTermsResult:
+    """Maps defined terms and cross-references in a long Estonian legal
+    document.
 
-    Extracts every term defined with `(edaspidi «X»)`, counts how often each
-    is actually used, lists `§` / `lõige` / `punkt` / `artikkel`
-    cross-references, and flags defined-but-unused or doubly-defined terms:
-    the consistency errors that creep into long contracts and statutes.
-
-    Regex-based and PII-free (nothing is stored). Input cap is raised to
-    500,000 characters so a whole contract fits in one call; the echoed
-    `text` is truncated to a 2,000-character preview.
+    defined_terms: each (edaspidi «X») term. total_occurrences counts
+    exact-form, case-sensitive matches, the definition included, so it
+    misses inflected uses: verify a defined-but-unused issue before
+    acting. cross_references: §, lõige, punkt and artikkel mentions, not
+    validated. issues: terms defined twice or unused.
     """
     return _check_defined_terms(text)
 
@@ -4357,11 +4033,14 @@ def _common_legal_usage(word: str) -> dict:
         lemma = (_first(list(span.lemma)) or "").lower()
         break
     lemmas = idx.get("lemmas", {})
-    entry = lemmas.get(lemma) or lemmas.get(word.lower())
+    # The entry actually matched, which the summary names: the lemma, or
+    # the lowercased input when the lemma is not indexed (võime analyses
+    # as võima, a light verb the index drops, but võime is indexed).
+    key = lemma if lemmas.get(lemma) else word.lower()
+    entry = lemmas.get(key)
 
     if not entry:
         return {
-            "word": word,
             "lemma": lemma or word.lower(),
             "found": False,
             "frequency": 0,
@@ -4371,38 +4050,18 @@ def _common_legal_usage(word: str) -> dict:
                 f"Sõna '{word}' ei esine juriidilise korpuse indeksis "
                 f"(võib olla haruldane või mitte juriidiline termin)."
             ),
-            "note": _LEGAL_USAGE_NOTE,
         }
 
     return {
-        "word": word,
         "lemma": lemma or word.lower(),
         "found": True,
         "frequency": entry.get("freq", 0),
         "common_before": [{"word": w, "count": c} for w, c in entry.get("left", [])],
         "common_after": [{"word": w, "count": c} for w, c in entry.get("right", [])],
         "summary_estonian": (
-            f"'{word}' esineb juriidilises korpuses {entry.get('freq', 0)} korda; "
-            f"sagedasimad naabersõnad on toodud common_before / common_after all."
+            f"'{key}' esineb juriidilises korpuses {entry.get('freq', 0)} korda."
         ),
-        "note": _LEGAL_USAGE_NOTE,
     }
-
-
-_LEGAL_USAGE_NOTE = (
-    "Canonical legal-usage lookup from an offline collocation index distilled "
-    "from Estonian legal corpora (see scripts/build_legal_collocations.py). "
-    "common_before / common_after are the content words most often seen "
-    "immediately before / after the term's lemma in real legislation, with "
-    "raw counts. Use them to pick idiomatic legal phrasing (e.g. 'esitama "
-    "hagi', 'kohustuse täitmine') instead of inventing collocations. It is a "
-    "frequency signal, NOT prescriptive: rare-but-correct phrasings exist, and "
-    "coverage is bounded by the corpus. The bundled index is built from "
-    "public-domain Riigi Teataja legislation: five core codes (obligations, "
-    "general civil, civil procedure, property, penal), ~2,000 legal terms; "
-    "broaden coverage by adding more acts and supplying the index via "
-    "ESTNLTK_MCP_LEGAL_INDEX. Deterministic and offline; no text is stored."
-)
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -4412,18 +4071,15 @@ _LEGAL_USAGE_NOTE = (
     openWorldHint=False,
 ))
 @_counted
-def common_legal_usage(word: Annotated[str, Field(description="A single Estonian (legal) word to look up canonical collocations for, e.g. 'hagi', 'kohustus', 'taotlus'.")]) -> _LegalUsageResult:
-    """Canonical legal collocations for a term, from an offline corpus index.
+def common_legal_usage(word: Annotated[str, Field(description="One Estonian word, any inflected form.")]) -> _LegalUsageResult:
+    """Standard legal collocations for an Estonian word, from an index of
+    Riigi Teataja legislation (the bundled one: five core codes). Use it
+    instead of inventing legal phrasing.
 
-    Answers "what's the standard legal phrasing": returns how often the
-    term occurs in Estonian legal text and the words most frequently seen
-    directly before/after it (`hagi` → `esitama` before it = 'esitama hagi';
-    `kohustus` → `täitmine` after it = 'kohustuse täitmine'). Use it so the
-    AI picks real, idiomatic legalese instead of inventing collocations.
-
-    A frequency signal, not prescriptive; coverage is bounded by the corpus.
-    The bundled index is a proof-of-concept sample; the full-corpus artifact
-    is loaded via ESTNLTK_MCP_LEGAL_INDEX. Input is a single word.
+    common_before / common_after: the commonest lemmas of the nearest
+    content word on each side, with counts; inflect them to fit. A
+    frequency signal, not a rule. found: false says only that the index
+    lacks the word, not that it is wrong.
     """
     return _common_legal_usage(word)
 
@@ -4518,7 +4174,8 @@ def _check_style(text: str) -> dict:
 
     # Summary lines in Estonian (so Claude can quote directly).
     rep_et = (
-        f"Kõige sagedamini korduvad lemmad: {[r['lemma'] for r in repeated]}."
+        f"Kõige sagedamini korduvad lemmad: "
+        f"{', '.join(r['lemma'] for r in repeated)}."
         if repeated else "Sõnade kordumist ei tuvastatud."
     )
     passive_et = (
@@ -4542,7 +4199,6 @@ def _check_style(text: str) -> dict:
     )
 
     return {
-        "text": text,
         "repetition": {
             "threshold": threshold,
             "repeated_lemmas": repeated,
@@ -4571,23 +4227,6 @@ def _check_style(text: str) -> dict:
             "matches": hedge_matches,
             "summary_estonian": hedge_et,
         },
-        "note": (
-            "Heuristic phase-1 style checker. Repetition threshold "
-            "scales with text length. `passive_voice` counts Estonian "
-            "umbisikuline tegumood: the -takse/-ti/-tud/-tav family, PLUS "
-            "negated impersonals ('ei esitata', 'ei avaldatud') that raw "
-            "Vabamorf form codes miss, MINUS `ei`/`ära` (tagged pos=V but "
-            "not real verbs) and MINUS attributive -tud participles "
-            "('lukustatud osa'), which are listed under "
-            "`attributive_excluded` instead. ~15% is a healthy ceiling for "
-            "marketing copy and <5% may read too forceful; for reports and "
-            "academic prose anything above ~40% is the single clearest "
-            "kantseliit signal. Pair this with check_officialese. "
-            "Hedging density >5% reads wishy-washy. Sentence length "
-            "stddev should typically be at least 30% of the mean for "
-            "natural rhythm. Quote *_estonian fields verbatim in "
-            "Estonian replies."
-        ),
     }
 
 
@@ -4598,25 +4237,19 @@ def _check_style(text: str) -> dict:
     openWorldHint=False,
 ))
 @_counted
-def check_style(text: Annotated[str, Field(description="Estonian text to compute style metrics for (repetition, passive voice, sentence length, hedging).")]) -> _StyleResult:
-    """Heuristic Estonian style metrics for newsletter / ad / email copy.
+def check_style(text: Annotated[str, Field(description="Estonian text to measure.")]) -> _StyleResult:
+    """Heuristic Estonian style metrics; no cliche detection.
 
-    Returns four metrics that flag common writing issues, each with an
-    Estonian-language summary line for quoting verbatim:
-
-    - repetition: lemma-aware (so 'kasutab' and 'kasutamine' both count
-      under 'kasutama'). Threshold scales with text length so short
-      replies don't fire on natural repeats.
-    - passive_voice: ratio of Estonian -takse/-ti/-tud/-tav forms over
-      total verbs. Newsletter copy usually wants <15%.
-    - sentence_length: mean, stddev, min, max in content words. Low
-      stddev = monotonous rhythm.
-    - hedging: density of hedging words (võib-olla, vist, pigem, ehk,
-      ilmselt, …). >5% reads wishy-washy.
-
-    Phase-1 limitation: heuristic only. No detection of cliché phrases,
-    weasel-words beyond the curated 15 lemmas, or genre-specific style
-    drift. Input capped at 100,000 characters.
+    - `repetition`: content lemmas used `threshold`+ times (scales with
+      length), with character offsets.
+    - `passive_voice`: umbisikuline tegumood share of verbs (attributive
+      -tud participles go to `attributive_excluded`). Marketing copy: aim
+      under 15%; under 5% may read forceful. Reports: over 40% is the
+      clearest kantseliit sign (see check_officialese).
+    - `sentence_length`: words per sentence; a stddev under 30% of the
+      mean reads monotonous.
+    - `hedging`: share of words on a short fixed list (vist, pigem,
+      ehk); over 5% reads wishy-washy, 0% does not rule hedging out.
     """
     return _check_style(text)
 
@@ -4760,11 +4393,8 @@ def _check_officialese(text: str) -> dict:
                 "rule": "long-sentence",
                 "rule_estonian": "liiga pikk lause",
                 "explanation": (
-                    f"Lauses on {n_words} sisusõna (piir "
-                    f"{_OFFICIALESE_LONG_SENTENCE_WORDS}). Eesti keeles "
-                    f"mahub käändevormide tõttu ühte lausesse rohkem infot "
-                    f"kui inglise keeles, nii et pikk lause muutub kiiresti "
-                    f"raskeks."
+                    f"Lauses on {n_words} sõna (piir "
+                    f"{_OFFICIALESE_LONG_SENTENCE_WORDS})."
                 ),
                 "suggestion": "jaga lause lühemateks lauseteks",
             })
@@ -4820,7 +4450,6 @@ def _check_officialese(text: str) -> dict:
     issues.sort(key=lambda d: d.get("position", 0))
 
     return {
-        "text": text,
         "issues": issues,
         "metrics": {
             "word_count": word_count,
@@ -4829,7 +4458,10 @@ def _check_officialese(text: str) -> dict:
             "noun_verb_ratio": round(noun_verb_ratio, 2),
             "nominalisations": nominalisations,
             "nominalisations_per_100_words": round(nom_per_100, 2),
-            "impersonal_voice": imp,
+            # verb_count above already carries imp["total_verbs"].
+            "impersonal_voice": {
+                k: v for k, v in imp.items() if k != "total_verbs"
+            },
         },
         "summary_estonian": (
             f"Leiti {len(issues)} kantseliidikohta. Nimisõnade ja tegusõnade "
@@ -4838,36 +4470,14 @@ def _check_officialese(text: str) -> dict:
             if issues else
             "Selget kantseliiti ei tuvastatud."
         ),
-        "note": (
-            "Heuristic kantseliit diagnostic for NON-legal Estonian "
-            "(reports, academic prose, business writing), the sibling of "
-            "check_legalese, which is scoped to statutes and stays silent "
-            "on report officialese. Thresholds are calibrated against a "
-            "native speaker's plain-language rewrite of a real Estonian R&D "
-            "report. Across that edit the impersonal ratio went 0.875 → "
-            "0.308, -mine nouns per 100 words 7.89 → 2.33 and the longest "
-            "sentence 30 → 21 content words, so those three gates (0.4, "
-            "4.0, 25) separate bureaucratic from plain cleanly. Noun/verb "
-            "moved only 2.50 → 2.23, so its gate (2.5) is deliberately "
-            "loose and that signal is the weakest of the four. Weigh it "
-            "last. `metrics.nominalisations` gives each "
-            "-mine noun with the verb to swap in. STARTER lexicons, "
-            "precision-first and not exhaustive: absence of flags is not "
-            "proof the text is plain. For legal text use check_legalese "
-            "instead: it protects terms of art, which this tool does not. "
-            "Quote rule_estonian and summary_estonian verbatim in Estonian "
-            "replies."
-        ),
     }
 
 
 class _OfficialeseResult(TypedDict, total=False):
     """Output of check_officialese: kantseliit issues + density metrics."""
-    text: str
     issues: list[dict]
     metrics: dict
     summary_estonian: str
-    note: str
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -4877,30 +4487,23 @@ class _OfficialeseResult(TypedDict, total=False):
     openWorldHint=False,
 ))
 @_counted
-def check_officialese(text: Annotated[str, Field(description="Estonian non-legal text (report, academic, business) to check for kantseliit / bureaucratic density.")]) -> _OfficialeseResult:
-    """Flag Estonian kantseliit in reports, academic and business prose.
+def check_officialese(text: Annotated[str, Field(description="Estonian non-legal prose (report, academic, business).")]) -> _OfficialeseResult:
+    """Flag Estonian kantseliit in reports, academic and business prose;
+    statutes and contracts go to check_legalese, which protects terms of
+    art.
 
-    check_legalese is the legal-text sibling; use THIS one for anything
-    that is not a statute or contract, where check_legalese finds nothing
-    because its lexicon and length gate are tuned for legislation.
+    Issue rules: `impersonal-voice` (ratio 0.4+, 4+ verbs),
+    `nominalisation` (4+ -mine nouns per 100 words, positioned at the
+    first), `noun-density` (noun/verb 2.5+, weakest: weigh it last),
+    `clause-stacking` (3+ subordinate-clause openers in a sentence),
+    `long-sentence` (25+ words), `officialese-filler`,
+    `officialese-phrase`, `poolt-calque`. `impersonal-voice` and
+    `noun-density` are document-wide (position 0).
+    `metrics.nominalisations` gives each -mine noun's verb (hindamine →
+    hindama).
 
-    Returns `issues` (each with an Estonian `rule_estonian` label, an
-    explanation and a concrete suggestion) plus `metrics`:
-
-    - nominalisation: -mine verbal nouns per 100 words, each paired with
-      the verb to use instead (`hindamine` → `hindama`)
-    - noun_verb_ratio: nimisõnastiil density; over ~2.0 reads heavy
-    - impersonal_voice: umbisikuline tegumood, correctly counted
-      (negated impersonals included, `ei`/`ära` and attributive -tud
-      participles excluded)
-    - clause-stacking: 3+ subordinate-clause openers in one sentence, the
-      'mille käigus … ning …' pile-up that a word count alone misses
-    - long-sentence: 25+ content words, calibrated for Estonian
-    - officialese filler: `omama` → `olema`, `kujutab endast` → `on`,
-      `viidi läbi` → `tehti`, `X-i poolt tehtud` → `X-i tehtud`
-
-    Heuristic and precision-first: no flags does not prove the text is
-    plain. Input capped at 100,000 characters.
+    Precision-first starter lexicons: no issues is not proof the text is
+    plain.
     """
     return _check_officialese(text)
 
@@ -4908,6 +4511,8 @@ def check_officialese(text: Annotated[str, Field(description="Estonian non-legal
 # How many distinct content nouns get a WordNet lookup in
 # check_term_consistency. Bounds cost on long documents; the nouns are
 # ranked by frequency first, so the cap drops only long-tail hapaxes.
+# The tool's docstring states this number; tests/test_officialese.py pins
+# the two together.
 _TERM_CONSISTENCY_WORDNET_CAP = 40
 
 
@@ -5067,7 +4672,6 @@ def _check_term_consistency(text: str, glossary: list[str] | None = None) -> dic
             seen_pairs.add((a, b))
             variants = sorted([a, b], key=lambda w: (-counts[w], w))
             groups.append({
-                "head": None,
                 "rule": "shared-wordnet-synset",
                 "rule_estonian": "sama tähendusrühm",
                 "synsets": sorted(shared),
@@ -5089,17 +4693,13 @@ def _check_term_consistency(text: str, glossary: list[str] | None = None) -> dic
     groups.sort(key=lambda g: g["variants"][0]["position"])
 
     return {
-        "text": text,
         "groups": groups,
         "terms_analysed": len(counts),
-        "rules_run": {
-            "shared-compound-head": True,
-            "shared-wordnet-synset": wordnet_ok,
-        },
         # Top-level so a caller cannot miss it. A partial run that reports
         # "nothing found" reads as a clean bill of health, which is exactly
         # how a half-strength checker misleads someone, so say it here AND
-        # in summary_estonian, not only in rules_run.
+        # in summary_estonian. The compound-head rule always runs; the
+        # WordNet rule ran exactly when this is false.
         "degraded": not wordnet_ok,
         "summary_estonian": (
             (
@@ -5118,49 +4718,15 @@ def _check_term_consistency(text: str, glossary: list[str] | None = None) -> dic
                 "`uv run python scripts/fetch_resources.py`."
             )
         ),
-        "note": (
-            "Heuristic terminology-consistency check: 'one referent, one "
-            "term'. Rule `shared-compound-head` fires when a bare noun and "
-            "a compound built on it both appear (andmestik + "
-            "teadusandmestik), or when 3+ lemmas share one head; two "
-            "compounds sharing a head is deliberately NOT enough, since "
-            "those are usually distinct things. Rule "
-            "`shared-wordnet-synset` fires when two lemmas sit in the same "
-            "Estonian WordNet synset, and does not run at all when that "
-            "resource is missing, in which case `degraded` is true and an "
-            "empty `groups` list means only that the compound-head rule "
-            "found nothing. The tool does NOT decide which "
-            "variant is correct (that needs domain context it cannot see); "
-            "it reports counts so you can pick the dominant term, and some "
-            "groups are legitimately distinct concepts. KNOWN GAP: "
-            "synonym pairs that share neither a head nor a synset "
-            "(korpus / andmestik) are not caught. For those, read each "
-            "candidate's `synonyms` definition and check whether its "
-            "domain fits the text. WordNet lookups are capped at the "
-            f"{_TERM_CONSISTENCY_WORDNET_CAP} most frequent nouns, and "
-            "`rules_run` reports whether the WordNet rule actually ran: "
-            "if the resource is unavailable it degrades to the "
-            "compound-head rule alone rather than failing. Input "
-            "capped at 100,000 characters."
-            + (" A domain glossary was applied: each variant carries "
-               "`in_domain_glossary`, and where exactly one variant of a "
-               "group is listed it is the group's `preferred` form, the "
-               "organisation's own term, whatever `dominant` says. Several "
-               "listed variants suggest distinct concepts, so none is "
-               "preferred." if terms else "")
-        ),
     }
 
 
 class _TermConsistencyResult(TypedDict, total=False):
     """Output of check_term_consistency: groups of competing terms."""
-    text: str
     groups: list[dict]
     terms_analysed: int
-    rules_run: dict
     degraded: bool
     summary_estonian: str
-    note: str
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -5171,42 +4737,29 @@ class _TermConsistencyResult(TypedDict, total=False):
 ))
 @_counted
 def check_term_consistency(
-    text: Annotated[str, Field(description="Estonian document to check for the same thing being named several different ways.")],
-    glossary: Annotated[list[_GlossaryTerm] | None, Field(max_length=MAX_GLOSSARY_TERMS, description="Optional domain lemmas (base forms), used for this call only alongside the server's ESTNLTK_MCP_DOMAIN_GLOSSARY file. A listed variant becomes its group's `preferred` form. Nothing is stored. Up to 1,000 terms of up to 200 characters each.")] = None,
+    text: Annotated[str, Field(description="The whole Estonian document, not one paragraph at a time.")],
+    glossary: Annotated[list[_GlossaryTerm] | None, Field(max_length=MAX_GLOSSARY_TERMS, description="Optional domain lemmas (base forms) for this call only, added to any server glossary. Not stored.")] = None,
 ) -> _TermConsistencyResult:
-    """Flag a document that calls the same thing several different names.
+    """Flag a document that names one thing several ways (andmestik,
+    teadusandmestik, pildiandmestik).
 
-    The classic long-document defect, and the one a model editing
-    paragraph-by-paragraph reliably misses: a dataset that is `andmestik`
-    on page 1, `teadusandmestik` on page 2 and `korpus` on page 3.
+    Rules: `shared-compound-head` (a bare noun plus a compound on it, or
+    3+ lemmas sharing a head) and `shared-wordnet-synset` (two of the 40
+    most frequent nouns share a WordNet synset). Each group gives
+    `variants` with counts and `dominant`, the most used. Some groups are
+    distinct concepts and the tool does not pick the right term: read
+    each first.
 
-    Two precision-first rules:
+    `degraded: true` means WordNet is missing and the synset rule did not
+    run: no groups is then no proof of consistency.
 
-    - `shared-compound-head`: a bare noun and a compound built on it both
-      occur (`andmestik` + `pildiandmestik`), or 3+ lemmas share one head.
-    - `shared-wordnet-synset`: two lemmas sit in one Estonian WordNet
-      synset, i.e. WordNet calls them synonyms.
+    With a domain glossary (the server's or `glossary`), variants carry
+    `in_domain_glossary`, and a group's only listed variant is its
+    `preferred` term, whatever `dominant` says (several listed suggest
+    distinct concepts).
 
-    Each group lists its variants with occurrence counts and the dominant
-    one, so you can standardise on the most-used term. The tool does not
-    decide which variant is right: some groups are genuinely distinct
-    concepts, so read them before rewriting.
-
-    CHECK `degraded` BEFORE TRUSTING AN EMPTY RESULT. When Estonian WordNet
-    is not installed, the `shared-wordnet-synset` rule cannot run; the tool
-    then returns `degraded: true`, says so in `summary_estonian`, and marks
-    the rule false in `rules_run`. "No groups found" from a degraded run
-    means "the compound-head rule found nothing", NOT "the terminology is
-    consistent".
-
-    With a domain glossary (the server's ESTNLTK_MCP_DOMAIN_GLOSSARY, or
-    `glossary` for this call), each variant carries `in_domain_glossary`,
-    and a group with exactly one listed variant names it as `preferred`:
-    the organisation's own term, whatever the counts say.
-
-    Known gap: synonyms sharing neither a head nor a synset (korpus /
-    andmestik) are not caught. Input capped at 100,000 characters;
-    `glossary` at 1,000 terms.
+    Misses synonyms sharing neither head nor synset (korpus /
+    andmestik): compare their `synonyms` definitions.
     """
     return _check_term_consistency(text, glossary)
 
@@ -5219,28 +4772,17 @@ def check_term_consistency(
 ))
 @_counted
 def classify_register(text: Annotated[str, Field(description="Estonian text to classify by register (formal vs colloquial).")]) -> _RegisterResult:
-    """Heuristic register classifier for Estonian (formal vs colloquial).
+    """Heuristic Estonian register score: a directional hint, not a verdict.
+    Most everyday prose scores neutral, and address forms (sina/teie)
+    are not scored.
 
-    Returns a tier label (English in `tier`, correct Estonian in
-    `tier_estonian`: quote that field verbatim when composing an
-    Estonian-language reply rather than translating `tier` yourself, to
-    avoid mistranslations like "formalne" instead of the correct
-    "formaalne"), a normalised score in [-1, 1] (positive = formal,
-    negative = colloquial), and the matched formal/colloquial markers
-    found in the text. Useful for sanity-checking that marketing copy
-    hasn't drifted into officialese, or that a contract draft hasn't
-    slipped into chat tone.
-
-    The lexicon covers legal-administrative AND academic/report
-    vocabulary. `structure` adds two syntactic signals (umbisikuline
-    tegumood ratio and noun/verb density), bounded at +0.4, applied only
-    from 25 words up and only when the lexicon is not net-colloquial.
-
-    LIMITATION: still a heuristic, not a trained model. Address forms and
-    finer syntax go uncaught, and most newsletter prose scores 'neutral'.
-    Use the result as a directional hint, not a verdict; for a full
-    kantseliit breakdown with per-issue suggestions, call
-    check_officialese. Input capped at 100,000 characters.
+    `score` runs from -1 (colloquial) to 1 (formal); `tier_estonian` is
+    the correct Estonian label to quote (formaalne, never *formalne).
+    `consistency.is_mixed`: formal and colloquial markers both occur,
+    which jars even when the tier is neutral. `structure` adds up to 0.4
+    (`applied`) for umbisikuline tegumood and noun density, from 25 words
+    up and never on net-colloquial text. For a per-issue kantseliit
+    breakdown use check_officialese.
     """
     return _classify_register(text)
 

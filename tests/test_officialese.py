@@ -2,13 +2,13 @@
 check_officialese, and check_term_consistency.
 
 These pin the behaviour against a real Estonian R&D report paragraph and
-the plain-language rewrite a native speaker produced from it — the
+the plain-language rewrite a native speaker produced from it: the
 bureaucratic original must flag and the human rewrite must come back
 clean. That pair is also what the thresholds in server.py are calibrated
 on, so a threshold change that breaks the separation fails here.
 
 Runs without fastText; the WordNet rule in check_term_consistency
-degrades to off when the resource is missing (asserted via `rules_run`
+degrades to off when the resource is missing (asserted via `degraded`
 rather than assumed).
 
 Run via:
@@ -17,6 +17,7 @@ Run via:
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -86,7 +87,7 @@ def _imp(text: str) -> dict:
 def impersonal_voice_corrections() -> None:
     """The four counting bugs, each pinned by the construction that
     exposed it on real text."""
-    print("impersonal voice — counting corrections")
+    print("impersonal voice: counting corrections")
 
     # (1) `ei` is tagged pos=V form=neg; counting it inflated total_verbs
     # and deflated the ratio.
@@ -102,7 +103,7 @@ def impersonal_voice_corrections() -> None:
     r = _imp("Meeskond otsustas esitada aruande.")
     check("bare da-infinitive not counted", r["passive_count"] == 0, str(r))
 
-    # (3) `ei avaldatud` gets tagged pos=A, not V — was skipped entirely.
+    # (3) `ei avaldatud` gets tagged pos=A, not V, so it was skipped entirely.
     r = _imp("Vastusevõtmeid hindajatele ei avaldatud.")
     check("`ei avaldatud` counted despite pos=A tag",
           r["passive_count"] == 1, str(r))
@@ -118,7 +119,7 @@ def impersonal_voice_corrections() -> None:
     check("`on kasutatud` counted as impersonal", r["passive_count"] == 1,
           str(r))
 
-    # `mitte` negates a noun phrase, not a verb — must not trigger.
+    # `mitte` negates a noun phrase, not a verb, so it must not trigger.
     r = _imp("Mõõdeti kooskõla, mitte inimeste antud märgenditega.")
     check("`mitte X antud` not counted as impersonal predicate",
           "antud" not in r["examples"], str(r))
@@ -131,8 +132,8 @@ def impersonal_voice_corrections() -> None:
 
 def officialese_separation() -> None:
     """The gates must separate the bureaucratic original from the human
-    rewrite — that separation IS the calibration."""
-    print("check_officialese — original vs human rewrite")
+    rewrite: that separation IS the calibration."""
+    print("check_officialese: original vs human rewrite")
 
     o1 = server.check_officialese(ORIG_P1)
     o2 = server.check_officialese(ORIG_P2)
@@ -175,9 +176,46 @@ def officialese_separation() -> None:
     check("nominalisation carries its verb (väljatöötamine → väljatöötama)",
           noms.get("väljatöötamine") == "väljatöötama", str(noms))
 
+    # The result carries findings only: no echo of the input, no static
+    # note, and the verb count once (metrics.verb_count), not twice.
+    check("no input echo or static note",
+          "text" not in o1 and "note" not in o1, str(sorted(o1)))
+    imp = o1["metrics"]["impersonal_voice"]
+    check("impersonal_voice drops its duplicate verb count",
+          "total_verbs" not in imp, str(sorted(imp)))
+    check("impersonal_voice keeps ratio, counts and examples",
+          {"passive_count", "ratio", "examples", "attributive_excluded"}
+          <= set(imp), str(sorted(imp)))
+    check("verb_count carries the impersonal-voice denominator",
+          o1["metrics"]["verb_count"] == _imp(ORIG_P1)["total_verbs"],
+          str(o1["metrics"]["verb_count"]))
+
+    # Position semantics the tool description states: the two
+    # document-wide rules sit at 0, nominalisation at its first -mine noun.
+    by_rule = {i["rule"]: i for i in o1["issues"]}
+    check("impersonal-voice is document-wide (position 0)",
+          by_rule["impersonal-voice"]["position"] == 0,
+          str(by_rule["impersonal-voice"]))
+    check("nominalisation is positioned at the first -mine noun",
+          by_rule["nominalisation"]["position"]
+          == o1["metrics"]["nominalisations"][0]["position"] > 0,
+          str(by_rule["nominalisation"]))
+
+    # A long-sentence issue states the count against the limit, once, with
+    # no static rationale repeated per flagged sentence.
+    longs = [i for res in (o1, o2) for i in res["issues"]
+             if i["rule"] == "long-sentence"]
+    check("long-sentence explanation is the count and the limit",
+          longs and all(
+              i["explanation"].startswith("Lauses on ")
+              and i["explanation"].endswith(
+                  f"(piir {server._OFFICIALESE_LONG_SENTENCE_WORDS}).")
+              for i in longs),
+          str([i["explanation"] for i in longs]))
+
 
 def officialese_lexicons() -> None:
-    print("check_officialese — filler, phrases, poolt-calque, clause stacking")
+    print("check_officialese: filler, phrases, poolt-calque, clause stacking")
     probe = (
         "Projekti raames viidi läbi analüüs, mis kujutab endast olulist "
         "etappi. Mudeli poolt loodud märgendid omavad tähtsust. "
@@ -229,6 +267,17 @@ def officialese_lexicons() -> None:
     check("plain prose flags nothing", len(r["issues"]) == 0,
           str([i["rule"] for i in r["issues"]]))
 
+    # impersonal-voice needs 4+ verbs as well as the ratio: two of three
+    # verbs impersonal is over 0.4 but too few verbs to call.
+    r = server.check_officialese("Andmed koguti. Tulemus valideeriti. Mina kirjutan.")
+    imp = r["metrics"]["impersonal_voice"]
+    check("under 4 verbs, a high impersonal ratio raises no issue",
+          imp["ratio"] >= server._OFFICIALESE_IMPERSONAL_RATIO
+          and r["metrics"]["verb_count"] < 4
+          and "impersonal-voice" not in {i["rule"] for i in r["issues"]},
+          str((imp["ratio"], r["metrics"]["verb_count"],
+               [i["rule"] for i in r["issues"]])))
+
 
 def term_consistency() -> None:
     print("check_term_consistency")
@@ -238,12 +287,25 @@ def term_consistency() -> None:
         "valmis mais."
     )
     r = server.check_term_consistency(doc)
-    check("rules_run reports the head rule ran",
-          r["rules_run"]["shared-compound-head"] is True, str(r["rules_run"]))
+    check("degraded is reported as a bool",
+          isinstance(r.get("degraded"), bool), str(r.get("degraded")))
+    check("no input echo, static note or rules_run",
+          not {"text", "note", "rules_run"} & set(r), str(sorted(r)))
 
     head_groups = [g for g in r["groups"] if g["rule"] == "shared-compound-head"]
     check("the andmestik variants are grouped", len(head_groups) >= 1,
           str(r["groups"]))
+    check("a compound-head group names its head", all(g.get("head") for g in head_groups),
+          str(head_groups))
+    # `head` does not apply to a synset group, and a field that does not
+    # apply is omitted (the server instructions promise it).
+    synset_doc = "Andmed koguti. Andmestik valideeriti. Andmed ja andmestik on olulised."
+    synset_groups = [g for g in server.check_term_consistency(synset_doc)["groups"]
+                     if g["rule"] == "shared-wordnet-synset"]
+    if server._wordnet_available():
+        check("a synset group is found", bool(synset_groups), synset_doc)
+    check("a synset group carries no head key", all("head" not in g for g in synset_groups),
+          str(synset_groups))
     if head_groups:
         g = head_groups[0]
         lemmas = {v["lemma"] for v in g["variants"]}
@@ -255,7 +317,7 @@ def term_consistency() -> None:
         check("group names a dominant term", bool(g.get("dominant")), str(g))
 
     # Two compounds sharing a head, with no bare head, is deliberately
-    # NOT enough — those are usually genuinely different things.
+    # NOT enough: those are usually genuinely different things.
     r = server.check_term_consistency(
         "Tegevusvaldkond on lai. Märgendusvaldkond on kitsam."
     )
@@ -269,6 +331,14 @@ def term_consistency() -> None:
     )
     check("consistent terminology flags nothing", len(r["groups"]) == 0,
           str(r["groups"]))
+
+    # The description states the WordNet cap as a number, so pin the two
+    # together: changing the constant without the docstring fails here.
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    desc = " ".join(tools["check_term_consistency"].description.split())
+    cap = server._TERM_CONSISTENCY_WORDNET_CAP
+    check("description states the WordNet cap",
+          f"the {cap} most frequent" in desc, desc[:160])
 
 
 def familiarity_junk_neighbourhood() -> None:

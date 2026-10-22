@@ -7,6 +7,156 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-22
+
+Every caller pays in tokens for what this server sends: the tool list on
+every turn, each result once it is read. This release cuts both without
+dropping what a caller cannot reconstruct. Measured with o200k_base over
+the real MCP protocol, on an 84-word paragraph and one call to each tool:
+the tools/list JSON goes from 13,961 to 8,095 tokens, the server
+instructions from 623 to 469, the results from 33,956 to 11,116 text
+tokens and from 24,346 to 11,131 tokens of compact structuredContent
+(what Claude Code, Codex and VS Code show the model). On ten times that
+paragraph the results go from 229,724 to 70,566 text tokens. Per-tool
+figures below are compact structuredContent too. Several output shapes
+change, hence the minor version: a client that reads a removed key must
+stop.
+
+### Changed
+
+- **One compact JSON block per result, and no nulls the tool did not
+  write.** The SDK sent a list result as one indented text block per
+  item (970 blocks for a 5,600-character `spell_check` input) and filled every
+  declared but absent output key with `null` in structuredContent. Each
+  result is now one compact block with exactly the keys the tool
+  returned, and structuredContent says the same. The tool list drops the
+  `title` annotations pydantic put on every schema node, and descriptions
+  arrive dedented and unwrapped. An argument error is one clause per
+  field, five at most, without a copy of the input.
+  `mcp` is pinned to `>=1.28,<2` for the SDK internals this relies on.
+- **No tool echoes its input.** `text`, `word` and `input` are gone from
+  every result that sent the caller's own input back, including the
+  2,000-character preview in `check_defined_terms`. The echo grew with
+  the input, so long documents save the most.
+- **No static `note`.** The paragraph each tool repeated on every call is
+  gone; the caveats that change how a result reads are in each tool's
+  description, said once. A `note` remains only where it reports
+  something about this result: a degraded or capped
+  `check_compound_familiarity` or `check_domain_terms` run.
+- **The server instructions say once what the tools used to repeat**:
+  quote the `*_estonian` labels, rules and summaries verbatim; the
+  `check_*` issue lists are heuristics, and an empty list means nothing
+  was found in that check's scope; the input caps; a field that does not
+  apply is omitted. The `paradigm` and `synonyms` guidance moved into
+  those tools' descriptions. A test pins the rules the tools rely on.
+- **Descriptions are shorter** (all but `pos_tag`'s, whose legend now
+  lists every tag; see Fixed). History, rationale and internals are
+  out; what each tool does, when to use a sibling instead, what the
+  fields mean and the caveats are in. Several descriptions now state
+  real limits they used to hide: `check_numbers` reads no context
+  (`10.30`, `1,250 kg`), `check_punctuation` misfires on `nii et`, `ilma
+  et` and verbless `nagu`, `check_capitalization` on line, list and
+  quotation starts, `check_object_case` skips negated sentences with
+  `olema` (`pole näinud`), `check_defined_terms` counts exact forms only,
+  `find_related_words` gives any string neighbours, even a typo.
+- **`spell_check` lists only the misspelled tokens**, one entry per
+  occurrence, each with `text`, `spelling: false` and `suggestions` when
+  Vabamorf has any. Clean text answers `[]`. On the sample paragraph the
+  answer goes from 1,378 tokens to 28.
+- **`analyze_morphology` sends a field only when it applies.** `usage_note`
+  and `usage_note_estonian` appear together on a flagged word;
+  `indeclinable` appears only as `true`; `clitic`, `form_estonian` and
+  `root_tokens` (two or more parts) only when they carry something;
+  `analyses_count` only above 1, and not under `all_analyses`, where it
+  always equalled the length of `analyses`. No `indeclinable` means
+  false, no `analyses_count` means 1. The result is 57% smaller.
+- **`lemmatize`, `pos_tag` and `analyze_morphology` leave out
+  punctuation**: tokens whose readings are all Vabamorf `Z` and that hold
+  no letter or digit, so operators (`+`, `=`) and emoticons (`:)`) go too.
+  Symbols such as `§` and `€` are `Y` and stay, and so does a word of 40
+  or more characters, which Vabamorf tags `Z` without analysing. These
+  lists no longer line up index for index with `tokenize`'s `words`,
+  which still holds every token.
+- **`paradigm`**: `summary_estonian` appears only when `forms` is empty,
+  and a table in `other_paradigms` carries `form_estonian` only for a
+  form code the first table lacks. Only `lemma` and `partofspeech` can
+  be null.
+- **`check_hyphenation`** returns `breaks`, `preferred` and
+  `syllable_count`; `summary_estonian` restated the breaks.
+- **`synonyms`** drops each synset's `pos`, which is in `name`
+  (`korpus.n.03`), and sends `definition` and `examples` only when
+  WordNet has them (`lahe.a.02` has no gloss and used to send
+  `definition: null`).
+- **`check_term_consistency`**: a `shared-wordnet-synset` group has no
+  `head` key; it used to send `head: null`. `head` belongs to
+  `shared-compound-head` groups.
+- **The issue-list checks** (`check_compounds`, `check_punctuation`,
+  `check_capitalization`, `check_numbers`, `check_object_case`,
+  `check_abbreviation_hyphenation`) drop each issue's `explanation`,
+  English that restated the rule. `check_redundancy`,
+  `check_officialese`, `check_legalese` and `check_defined_terms` keep
+  theirs, which is Estonian a model can quote. `check_object_case` drops
+  `suggestion_hint`: the fix is the partitive of `lemma`, in the number
+  `form` shows.
+- **`check_compound_familiarity`**: `suspect_compounds` and
+  `unattested_compounds` are lists of lemmas (`["mõtteliin"]`); the full
+  entries stay in `all_compounds`. Attested compounds carry no
+  `neighbours` and are no longer searched, since being attested settles
+  the verdict; a legal term of art keeps `neighbour_quality:
+  {"legal_term": true}`. `neighbour_quality` keeps `signal`.
+- **`check_domain_terms`**: without glossary terms a reported compound
+  is `word`, `lemma`, `position` and `in_wordnet`, and the look-alike
+  pass is skipped; with them, `contains_glossary_term` appears only when
+  the compound is built on one.
+- **`check_officialese`**: a `long-sentence` explanation is the count
+  against the limit (`Lauses on 31 sõna (piir 25).`) without the
+  fixed rationale that followed it on every flagged sentence.
+  **`check_legalese`** likewise: `Lause on 28 sõna ja 8 koma.`
+- **`common_legal_usage`**: `summary_estonian` names the index entry
+  whose frequency it gives.
+
+### Removed
+
+- `is_ambiguous` (`analyze_morphology`): it was always
+  `analyses_count > 1`.
+- `top_score`, `top_neighbour` and `reasons` on
+  `check_compound_familiarity` compounds (`neighbours[0]` carries them),
+  and `neighbour_quality.wordnet`, `.neighbours`, `.scrape_junk` and
+  `.subword_echoes`.
+- `rules_run` (`check_term_consistency`): the WordNet rule ran exactly
+  when `degraded` is false.
+- `metrics.impersonal_voice.total_verbs` (`check_officialese`): always
+  equal to `metrics.verb_count`.
+
+### Fixed
+
+- **`analyze_morphology` called verb-bound words foreign.** Vabamorf's
+  `X` is a word that belongs with a verb (`plehku` in `pani plehku`), yet
+  each came back as `võõrsõna või tundmatu sõna`. It now carries no
+  usage note.
+- **The `pos_tag` legend called `X` foreign** and hid `H`, `C`, `U`, `G`
+  and `O` behind "etc."; it now lists every tag, and says `Y` covers
+  symbols as well as abbreviations.
+- **`check_abbreviation_hyphenation` described its scope wrongly.** Any
+  all-capital stem is checked, known or not (`XYZQst`), and a mixed-case
+  one (`SaaSi`, `PhDga`) never is.
+- **`check_style`'s repetition summary put a Python list into Estonian
+  prose** (`korduvad lemmad: ['olema'].`); it now reads `korduvad lemmad:
+  olema, süsteem.` Its description and the skill also said `kasutamine`
+  counts under `kasutama`; it does not.
+- **`check_officialese`'s description gave the noun/verb gate as about
+  2.0**; the rule fires at 2.5. It now also states the 4-verb minimum for
+  `impersonal-voice`, and which issues are document-wide at position 0.
+- **`check_hyphenation`'s description said compound seams go
+  unmarked.** They are among the breaks, just not singled out.
+- **`check_officialese` counted every word of a long sentence and called
+  them content words** (`Lauses on 34 sisusõna`, with `ja`, `me` and `mis`
+  among them). The explanation now says `sõna`, as the description does.
+- **`find_related_words` sent `NaN` in its text block** for a string with
+  no known subword (`xqzzyv`), whose vector is all zeros. `NaN` is not
+  JSON, so a strict client could not parse the result; it is now `null`,
+  as structuredContent always had it.
+
 ### Security
 
 - Image scan fixes: a build of this tree now passes trivy's gate on
